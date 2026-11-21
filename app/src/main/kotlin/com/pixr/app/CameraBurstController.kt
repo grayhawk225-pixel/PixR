@@ -49,7 +49,10 @@ class CameraInfo(
     val make: String,
     val model: String,
     val exposureRange: LongRange?,
-    val isoRange: IntRange?
+    val isoRange: IntRange?,
+    val aeCompMin: Int,
+    val aeCompMax: Int,
+    val aeCompStep: Float
 ) {
     val summary: String
         get() = (if (strategy == CaptureStrategy.RAW) "RAW_SENSOR" else "Repli YUV_420_888") +
@@ -77,6 +80,9 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
     private var previewBuilder: CaptureRequest.Builder? = null
     private var closed = false
     private var zoom = 1f
+    @Volatile private var ev = 0f
+    @Volatile var look: RenderLook = RenderLook.NATURAL
+    @Volatile var deferred = false
     @Volatile private var lastPreview: TotalCaptureResult? = null
     private var pending: Pending? = null
 
@@ -87,6 +93,8 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
         val factor: Int,
         val textMode: Boolean,
         val rotation: Int,
+        val tone: FloatArray,
+        val deferred: Boolean,
         val onDone: (CameraOutcome) -> Unit
     ) {
         val raw = ArrayList<ShortArray>()
@@ -176,6 +184,7 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
             b.addTarget(surface)
             b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
             applyZoom(b, zoom)
+            b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeIndex())
             previewBuilder = b
             s.setRepeatingRequest(b.build(), object : CameraCaptureSession.CaptureCallback() {
                 override fun onCaptureCompleted(
@@ -217,6 +226,23 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
         handler = null
         if (p != null && !p.finished) {
             main.post { p.onDone(CameraOutcome(false, "Capture interrompue", null, null)) }
+        }
+    }
+
+    // ------------------------------------------------------------------ exposition
+
+    private fun aeIndex(): Int = ExposureMath.compensationIndex(ev, info.aeCompStep, info.aeCompMin, info.aeCompMax)
+
+    /** Compensation d'exposition en EV : physique (AE, par pas) puis reste appliqué numériquement à la fusion. */
+    fun setExposureBias(value: Float) {
+        ev = value.coerceIn(-ExposureMath.MAX_EV, ExposureMath.MAX_EV)
+        val b = previewBuilder ?: return
+        val s = session ?: return
+        b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, aeIndex())
+        try {
+            s.setRepeatingRequest(b.build(), null, handler)
+        } catch (_: CameraAccessException) {
+        } catch (_: IllegalStateException) {
         }
     }
 
@@ -263,14 +289,24 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
             device = camera ?: return false
             r = reader ?: return false
         }
-        val n = BurstRules.frameCount(textMode, zoomStep)
+        val raw = info.strategy == CaptureStrategy.RAW
+        val defer = deferred && raw
         val w = info.captureSize.width
         val h = info.captureSize.height
         val crop = ZoomMath.centerCrop(w, h, zoomStep)
-        val raw = info.strategy == CaptureStrategy.RAW
         val region = if (raw) ZoomMath.region(crop, w, h, ALIGN_MARGIN) else crop
+        val n = if (defer) {
+            val frameBytes = (region[2] - region[0]).toLong() * (region[3] - region[1]) * 2L
+            val budget = minOf(Runtime.getRuntime().maxMemory() * 45 / 100, 240L * 1024 * 1024)
+            DeferredRules.frameCount(frameBytes, budget)
+        } else BurstRules.frameCount(textMode, zoomStep)
         val rel = if (raw) ZoomMath.relative(crop, region) else intArrayOf(0, 0, crop[2] - crop[0], crop[3] - crop[1])
-        val p = Pending(n, region, rel, ZoomMath.outputFactor(zoomStep), textMode, displayRotation(), onDone)
+        val idx = aeIndex()
+        val tone = ExposureMath.tone(
+            look, ExposureMath.residualEv(ev, info.aeCompStep, idx),
+            if (defer) DeferredRules.DENOISE_DEFERRED else DeferredRules.DENOISE_IMMEDIATE
+        )
+        val p = Pending(n, region, rel, ZoomMath.outputFactor(zoomStep), textMode, displayRotation(), tone, defer, onDone)
         try {
             val reqs = ArrayList<CaptureRequest>()
             val preview = lastPreview
@@ -278,6 +314,7 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
                 val b = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                 b.addTarget(r.surface)
                 b.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                b.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, idx)
                 if (textMode && preview != null) applyTextExposure(b, preview)
                 reqs.add(b.build())
             }
@@ -418,40 +455,9 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
 
     private fun process(p: Pending) {
         val outcome = try {
-            if (!NativeEngine.available) error("Moteur natif indisponible")
+            check(NativeEngine.available) { "Moteur natif indisponible" }
             val res = p.results[0]
-            val rw = p.region[2] - p.region[0]
-            val rh = p.region[3] - p.region[1]
-            val pixels: IntArray
-            val ow: Int
-            val oh: Int
-            if (info.strategy == CaptureStrategy.RAW) {
-                val g = res.get(CaptureResult.COLOR_CORRECTION_GAINS)
-                val gains = WhiteBalance.resolve(
-                    g?.let { floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) },
-                    res.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.let { arr -> FloatArray(arr.size) { arr[it].toFloat() } }
-                )
-                val resultCcm = res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { toMatrix(it) }
-                val ccm = ColorMath.resolveCcm(if (ColorMath.isNearIdentity(resultCcm)) null else resultCcm, info.forwardMatrix)
-                pixels = NativeEngine.fuseRawBurst(
-                    p.raw.toTypedArray(), rw, rh, info.cfa, info.blackLevels, info.whiteLevel,
-                    gains, ccm, p.factor, p.relCrop, p.textMode
-                ) ?: error("Fusion RAW refusée par le moteur")
-                ow = (p.relCrop[2] - p.relCrop[0]) * p.factor
-                oh = (p.relCrop[3] - p.relCrop[1]) * p.factor
-                p.raw.clear()
-            } else {
-                pixels = NativeEngine.fuse(p.yuv.toTypedArray(), rw, rh, 50) ?: error("Fusion YUV refusée par le moteur")
-                ow = rw * 2
-                oh = rh * 2
-                p.yuv.clear()
-            }
-            var bmp = Bitmap.createBitmap(pixels, ow, oh, Bitmap.Config.ARGB_8888)
             val rot = (info.sensorOrientation - p.rotation + 360) % 360
-            if (rot != 0) {
-                val m = Matrix().apply { postRotate(rot.toFloat()) }
-                bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
-            }
             val exif = CameraExif(
                 make = info.make,
                 model = info.model,
@@ -461,14 +467,58 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
                 iso = res.get(CaptureResult.SENSOR_SENSITIVITY),
                 focalLengthMm = res.get(CaptureResult.LENS_FOCAL_LENGTH)
             )
-            val note = CameraExifFormat.note(info.strategy == CaptureStrategy.RAW, p.n)
-            val saved = Exporter.save(appContext, bmp, null, p.factor, ExportFormat.JPEG98, note, exif)
-            if (saved == null) {
-                CameraOutcome(false, "Enregistrement impossible", null, null)
+            if (info.strategy == CaptureStrategy.RAW) {
+                val g = res.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                val gains = WhiteBalance.resolve(
+                    g?.let { floatArrayOf(it.red, it.greenEven, it.greenOdd, it.blue) },
+                    res.get(CaptureResult.SENSOR_NEUTRAL_COLOR_POINT)?.let { arr -> FloatArray(arr.size) { arr[it].toFloat() } }
+                )
+                val resultCcm = res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { toMatrix(it) }
+                val ccm = ColorMath.resolveCcm(if (ColorMath.isNearIdentity(resultCcm)) null else resultCcm, info.forwardMatrix)
+                val job = RawJob(
+                    frames = ArrayList(p.raw),
+                    w = p.region[2] - p.region[0],
+                    h = p.region[3] - p.region[1],
+                    cfa = info.cfa,
+                    blacks = info.blackLevels,
+                    white = info.whiteLevel,
+                    gains = gains,
+                    ccm = ccm,
+                    factor = p.factor,
+                    relCrop = p.relCrop,
+                    textMode = p.textMode,
+                    tone = p.tone,
+                    rotationDeg = rot,
+                    exif = exif
+                )
+                p.raw.clear()
+                if (p.deferred) {
+                    RawJobStore.write(appContext, job)
+                    RawJobStore.schedule(appContext)
+                    val queued = RawJobStore.pending(appContext).size
+                    CameraOutcome(true, "${job.frames.size} trames en file : développement en arrière-plan ($queued en attente)", null, null)
+                } else {
+                    RawDeveloper.develop(appContext, job)
+                }
             } else {
-                val scale = 480f / maxOf(bmp.width, bmp.height)
-                val thumb = if (scale < 1f) Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true) else bmp
-                CameraOutcome(true, "Enregistré dans Pictures/PixR (${p.n} trames, ${bmp.width}×${bmp.height})", thumb, saved.uri)
+                val rw = p.region[2] - p.region[0]
+                val rh = p.region[3] - p.region[1]
+                val pixels = NativeEngine.fuse(p.yuv.toTypedArray(), rw, rh, 50) ?: error("Fusion YUV refusée par le moteur")
+                p.yuv.clear()
+                var bmp = Bitmap.createBitmap(pixels, rw * 2, rh * 2, Bitmap.Config.ARGB_8888)
+                if (rot != 0) {
+                    val m = Matrix().apply { postRotate(rot.toFloat()) }
+                    bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+                }
+                val note = CameraExifFormat.note(false, p.n)
+                val saved = Exporter.save(appContext, bmp, null, p.factor, ExportFormat.JPEG98, note, exif)
+                if (saved == null) {
+                    CameraOutcome(false, "Enregistrement impossible", null, null)
+                } else {
+                    val scale = 480f / maxOf(bmp.width, bmp.height)
+                    val thumb = if (scale < 1f) Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true) else bmp
+                    CameraOutcome(true, "Enregistré dans Pictures/PixR (${p.n} trames, ${bmp.width}×${bmp.height})", thumb, saved.uri)
+                }
             }
         } catch (t: Throwable) {
             CameraOutcome(false, "Échec : ${t.message}", null, null)
@@ -543,7 +593,10 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
                     make = Build.MANUFACTURER,
                     model = Build.MODEL,
                     exposureRange = c.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)?.let { it.lower..it.upper },
-                    isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { it.lower..it.upper }
+                    isoRange = c.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)?.let { it.lower..it.upper },
+                    aeCompMin = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.lower ?: 0,
+                    aeCompMax = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)?.upper ?: 0,
+                    aeCompStep = c.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_STEP)?.toFloat() ?: 0f
                 )
             }
             return best

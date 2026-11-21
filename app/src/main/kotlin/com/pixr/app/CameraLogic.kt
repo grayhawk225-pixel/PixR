@@ -57,6 +57,17 @@ object BurstRules {
     )
 }
 
+object DeferredRules {
+    const val MAX_FRAMES = 12
+    const val DENOISE_IMMEDIATE = 0.35f
+    const val DENOISE_DEFERRED = 0.8f
+
+    /** Nombre de trames d'une rafale à développer plus tard : borné par la mémoire (budget en octets) et par 6..12. */
+    fun frameCount(frameBytes: Long, budgetBytes: Long): Int =
+        if (frameBytes <= 0L) BurstRules.MIN_FRAMES
+        else (budgetBytes / frameBytes).toInt().coerceIn(BurstRules.MIN_FRAMES, MAX_FRAMES)
+}
+
 object ZoomMath {
     val STEPS: List<Float> = listOf(1f, 2f, 3f, 4f)
 
@@ -260,4 +271,28 @@ object CameraExifFormat {
     fun note(raw: Boolean, frames: Int): String =
         if (raw) "PixR Caméra RAW ×$frames trames, 0 % génératif"
         else "PixR Caméra (repli YUV) ×$frames trames, 0 % génératif"
+}
+
+/** Rendu de sortie : contraste (courbe en S) et saturation, appliqués après l'exposition automatique douce. */
+enum class RenderLook(val label: String, val contrast: Float, val saturation: Float) {
+    NATURAL("Naturel", 0.35f, 1.10f),
+    VIVID("Éclatant", 0.60f, 1.25f),
+    SOFT("Doux", 0.15f, 1.00f)
+}
+
+object ExposureMath {
+    const val MAX_EV = 2f
+
+    fun evGain(ev: Float): Float = Math.pow(2.0, ev.toDouble()).toFloat()
+
+    /** Indice de compensation d'exposition AE le plus proche, borné à la plage du capteur. */
+    fun compensationIndex(ev: Float, step: Float, min: Int, max: Int): Int =
+        if (step <= 0f) 0 else Math.round(ev / step).coerceIn(min, max)
+
+    /** EV restant à appliquer numériquement une fois la compensation AE (par pas) retirée. */
+    fun residualEv(ev: Float, step: Float, index: Int): Float = if (step <= 0f) ev else ev - index * step
+
+    /** Paramètres de rendu pour le moteur natif : [gain d'exposition numérique, contraste, saturation, débruitage 0..1]. */
+    fun tone(look: RenderLook, residualEv: Float, denoise: Float = 0.35f): FloatArray =
+        floatArrayOf(evGain(residualEv), look.contrast, look.saturation, denoise)
 }

@@ -470,6 +470,60 @@ namespace {
 constexpr int kCfaColor[4][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}};
 constexpr float kRawReject = 32.0f;  // écart de luminance (0..255) rejetant un échantillon en mouvement
 
+// Débruitage déterministe préservant les contours (filtre bilatéral 5x5 sur luminance + chrominance).
+// Il ne fait que moyenner des pixels réels voisins de valeur proche : aucun détail n'est créé.
+// rgb : 3 flottants 0..255 par pixel (modifié en place) ; strength 0..1 ; tmp : tampon de travail.
+void bilateralDenoiseRgb(std::vector<float>& rgb, int w, int h, float strength, std::vector<float>& tmp) {
+    const size_t n = static_cast<size_t>(w) * h;
+    tmp.resize(n * 3);
+    for (size_t i = 0; i < n; ++i) {
+        const float r = rgb[i * 3], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
+        const float y = 0.299f * r + 0.587f * g + 0.114f * b;
+        tmp[i * 3] = y;
+        tmp[i * 3 + 1] = (b - y) * 0.564f;
+        tmp[i * 3 + 2] = (r - y) * 0.713f;
+    }
+    const float sy = 3.0f + 12.0f * strength;  // tolérance luminance : les contours plus forts sont préservés
+    const float sc = 6.0f + 24.0f * strength;  // tolérance chrominance : le bruit couleur se lisse plus largement
+    const float invY = 1.0f / (2.0f * sy * sy);
+    const float invC = 1.0f / (2.0f * sc * sc);
+    static const float kSp[3] = {1.0f, 0.6065f, 0.1353f};  // gaussienne spatiale pour des écarts de 0, 1 et 2 px
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            const size_t c = static_cast<size_t>(y) * w + x;
+            const float cy = tmp[c * 3], cb = tmp[c * 3 + 1], cr = tmp[c * 3 + 2];
+            float sumY = 0.0f, sumB = 0.0f, sumR = 0.0f, wY = 0.0f, wC = 0.0f;
+            for (int dy = -2; dy <= 2; ++dy) {
+                const int yy = y + dy;
+                if (yy < 0 || yy >= h) continue;
+                for (int dx = -2; dx <= 2; ++dx) {
+                    const int xx = x + dx;
+                    if (xx < 0 || xx >= w) continue;
+                    const size_t q = static_cast<size_t>(yy) * w + xx;
+                    const float dY = tmp[q * 3] - cy, dB = tmp[q * 3 + 1] - cb, dR = tmp[q * 3 + 2] - cr;
+                    const float sp = kSp[dx < 0 ? -dx : dx] * kSp[dy < 0 ? -dy : dy];
+                    const float wy = sp * std::exp(-dY * dY * invY);
+                    const float wc = sp * std::exp(-(dY * dY + dB * dB + dR * dR) * invC);
+                    sumY += wy * tmp[q * 3];
+                    wY += wy;
+                    sumB += wc * tmp[q * 3 + 1];
+                    sumR += wc * tmp[q * 3 + 2];
+                    wC += wc;
+                }
+            }
+            const float fy = wY > 1e-6f ? sumY / wY : cy;
+            const float fb = wC > 1e-6f ? sumB / wC : cb;
+            const float fr = wC > 1e-6f ? sumR / wC : cr;
+            const float r = fy + fr / 0.713f;
+            const float b = fy + fb / 0.564f;
+            const float g = (fy - 0.299f * r - 0.114f * b) / 0.587f;
+            rgb[c * 3] = clampf(r, 0.0f, 255.0f);
+            rgb[c * 3 + 1] = clampf(g, 0.0f, 255.0f);
+            rgb[c * 3 + 2] = clampf(b, 0.0f, 255.0f);
+        }
+    }
+}
+
 struct RawCtx {
     int w = 0, h = 0, cfa = 0;
     float black[4] = {0, 0, 0, 0};
@@ -508,10 +562,12 @@ void rawLumaPlane(const RawCtx& c, const jshort* d, std::vector<float>& plane) {
 extern "C" JNIEXPORT jintArray JNICALL
 Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobjectArray framesArr, jint w, jint h,
                                             jint cfa, jintArray blackArr, jint whiteLevel, jfloatArray gainsArr,
-                                            jfloatArray ccmArr, jint factor, jintArray cropArr, jboolean textMode) {
-    if (!framesArr || !blackArr || !gainsArr || !ccmArr || !cropArr) return nullptr;
+                                            jfloatArray ccmArr, jint factor, jintArray cropArr, jboolean textMode,
+                                            jfloatArray toneArr) {
+    if (!framesArr || !blackArr || !gainsArr || !ccmArr || !cropArr || !toneArr) return nullptr;
+    if (env->GetArrayLength(toneArr) < 3) return nullptr;
     const int n = env->GetArrayLength(framesArr);
-    if (n < 2 || n > 8 || w < 256 || h < 256 || (w & 1) || (h & 1)) return nullptr;
+    if (n < 2 || n > 16 || w < 256 || h < 256 || (w & 1) || (h & 1)) return nullptr;
     if (cfa < 0 || cfa > 3 || factor < 1 || factor > 2 || whiteLevel <= 0) return nullptr;
     if (env->GetArrayLength(blackArr) < 4 || env->GetArrayLength(gainsArr) < 4 || env->GetArrayLength(ccmArr) < 9 ||
         env->GetArrayLength(cropArr) < 4)
@@ -559,6 +615,45 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
     const int w2 = w / 2, h2 = h / 2;
     std::vector<float> LR, LF;
     rawLumaPlane(ctx, px[0], LR);
+    // Rendu : exposition automatique douce (point noir + gain sur le blanc), puis courbe de contraste et
+    // saturation. Statistiques prises sur la luminance linéaire de la trame de référence, dans le recadrage.
+    jfloat tone[3];
+    env->GetFloatArrayRegion(toneArr, 0, 3, tone);
+    const float evGain = std::min(std::max(tone[0], 0.25f), 4.0f);
+    const float contrast = std::min(std::max(tone[1], 0.0f), 1.0f);
+    const float saturation = std::min(std::max(tone[2], 0.0f), 2.0f);
+    float denoise = 0.0f;
+    if (env->GetArrayLength(toneArr) >= 4) {
+        jfloat d = 0.0f;
+        env->GetFloatArrayRegion(toneArr, 3, 1, &d);
+        denoise = std::min(std::max(d, 0.0f), 1.0f);
+    }
+    float blackPt = 0.0f, autoGain = 1.0f;
+    {
+        constexpr int kBins = 1024;
+        std::vector<int> hist(kBins, 0);
+        int64_t total = 0;
+        const int bx0 = crop[0] / 2, bx1 = std::max(bx0 + 1, crop[2] / 2);
+        const int by0 = crop[1] / 2, by1 = std::max(by0 + 1, crop[3] / 2);
+        for (int y = by0; y < std::min(by1, h2); ++y)
+            for (int x = bx0; x < std::min(bx1, w2); ++x) {
+                const float l = std::min(std::max(LR[static_cast<size_t>(y) * w2 + x] / 255.0f, 0.0f), 1.0f);
+                ++hist[std::min(static_cast<int>(l * (kBins - 1) + 0.5f), kBins - 1)];
+                ++total;
+            }
+        if (total > 0) {
+            auto pct = [&](double q) {
+                const int64_t target = static_cast<int64_t>(q * static_cast<double>(total));
+                int64_t acc = 0;
+                for (int i = 0; i < kBins; ++i) { acc += hist[i]; if (acc >= target) return static_cast<float>(i) / (kBins - 1); }
+                return 1.0f;
+            };
+            blackPt = std::min(pct(0.002), 0.04f);
+            const float white = std::max(pct(0.997), blackPt + 0.05f);
+            autoGain = std::min(std::max(0.94f / (white - blackPt), 1.0f), 2.5f);
+        }
+    }
+    const float toneGain = autoGain * evGain;
     std::vector<std::vector<Motion>> motions(n);
     int gbw = 0, gbh = 0;
     for (int k = 1; k < n; ++k) {
@@ -588,15 +683,16 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
     const float invF = 1.0f / static_cast<float>(factor);
     const float sharpen = textMode ? 0.6f : 0.0f;
     constexpr int tileSize = 128;
-    std::vector<float> buf, lp;
+    std::vector<float> buf, lp, dnTmp;
     for (int64_t ty = 0; ty < oh; ty += tileSize) {
         for (int64_t tx = 0; tx < ow; tx += tileSize) {
             const int tw = static_cast<int>(std::min<int64_t>(tileSize, ow - tx));
             const int th = static_cast<int>(std::min<int64_t>(tileSize, oh - ty));
-            const int rx0 = static_cast<int>(std::max<int64_t>(0, tx - 1));
-            const int ry0 = static_cast<int>(std::max<int64_t>(0, ty - 1));
-            const int rx1 = static_cast<int>(std::min<int64_t>(ow, tx + tw + 1));
-            const int ry1 = static_cast<int>(std::min<int64_t>(oh, ty + th + 1));
+            constexpr int kHalo = 3;
+            const int rx0 = static_cast<int>(std::max<int64_t>(0, tx - kHalo));
+            const int ry0 = static_cast<int>(std::max<int64_t>(0, ty - kHalo));
+            const int rx1 = static_cast<int>(std::min<int64_t>(ow, tx + tw + kHalo));
+            const int ry1 = static_cast<int>(std::min<int64_t>(oh, ty + th + kHalo));
             const int rw = rx1 - rx0, rh = ry1 - ry0;
             buf.assign(static_cast<size_t>(rw) * rh * 3, 0.0f);
             for (int y = 0; y < rh; ++y) {
@@ -645,13 +741,23 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                     float v[3];
                     for (int c = 0; c < 3; ++c) v[c] = ws[c] > 1e-6f ? std::min(acc[c] / ws[c], 1.0f) : 0.0f;
                     float* o = &buf[(static_cast<size_t>(y) * rw + x) * 3];
+                    float g[3];
                     for (int r = 0; r < 3; ++r) {
                         float lin = ccm[r * 3] * v[0] + ccm[r * 3 + 1] * v[1] + ccm[r * 3 + 2] * v[2];
-                        lin = clampf(lin, 0.0f, 1.0f);
-                        o[r] = gammaLut[static_cast<int>(lin * kGammaN + 0.5f)];
+                        lin = clampf((lin - blackPt) * toneGain, 0.0f, 1.0f);
+                        g[r] = gammaLut[static_cast<int>(lin * kGammaN + 0.5f)] * (1.0f / 255.0f);
                     }
+                    // Contraste : S-curve douce (smoothstep) mélangée à l'identité, sur chaque canal.
+                    for (int r = 0; r < 3; ++r) {
+                        const float x = g[r];
+                        g[r] = x + contrast * (x * x * (3.0f - 2.0f * x) - x);
+                    }
+                    // Saturation autour de la luminance (préserve les gris neutres).
+                    const float yl = 0.2126f * g[0] + 0.7152f * g[1] + 0.0722f * g[2];
+                    for (int r = 0; r < 3; ++r) o[r] = clampf(yl + saturation * (g[r] - yl), 0.0f, 1.0f) * 255.0f;
                 }
             }
+            if (denoise > 0.0f) bilateralDenoiseRgb(buf, rw, rh, denoise, dnTmp);
             if (sharpen > 0.0f) {
                 lp.assign(buf.size(), 0.0f);
                 blur3x3(buf, rw, rh, lp);

@@ -39,8 +39,15 @@ import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Error
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -154,10 +161,11 @@ private fun StabilityIndicator() {
         horizontalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         Icon(icon, contentDescription = null, Modifier.size(20.dp), tint = tint)
-        Text("Stabilité : ${level.label}", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurface)
+        Text(level.label, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurface)
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) {
     val context = LocalContext.current
@@ -169,6 +177,10 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
     var zoom by remember { mutableFloatStateOf(1f) }
     var textMode by remember { mutableStateOf(false) }
     var thumb by remember { mutableStateOf<Bitmap?>(null) }
+    var ev by remember { mutableFloatStateOf(0f) }
+    var look by remember { mutableStateOf(RenderLook.NATURAL) }
+    var showRender by remember { mutableStateOf(false) }
+    var deferred by remember { mutableStateOf(false) }
 
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {
@@ -186,6 +198,9 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
         if (t != null && resumed) {
             c = CameraBurstController(context, info)
             c.setZoom(zoom)
+            c.setExposureBias(ev)
+            c.look = look
+            c.deferred = deferred
             c.start(t) { status = UiStatus(it, StatusKind.ERROR); busy = false }
             controller = c
         }
@@ -207,8 +222,13 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
             Icon(Icons.Rounded.Description, contentDescription = null, Modifier.size(18.dp))
             Text("Texte / Loin", Modifier.padding(start = 8.dp))
         }
-        if (textMode) FilledTonalButton(onClick = { textMode = false }, modifier = toggleModifier) { content() }
-        else OutlinedButton(onClick = { textMode = true }, modifier = toggleModifier) { content() }
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (textMode) FilledTonalButton(onClick = { textMode = false }, modifier = toggleModifier) { content() }
+            else OutlinedButton(onClick = { textMode = true }, modifier = toggleModifier) { content() }
+            IconButton(onClick = { showRender = true }, modifier = Modifier.size(48.dp)) {
+                Icon(Icons.Rounded.Tune, contentDescription = "Rendu : exposition et style")
+            }
+        }
     }
 
     val ratio = info.previewSize.height.toFloat() / info.previewSize.width.toFloat()
@@ -265,5 +285,51 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
             Box(Modifier.size(56.dp))
         }
         StatusLine(status)
+    }
+
+    if (showRender) {
+        ModalBottomSheet(
+            onDismissRequest = { showRender = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        ) {
+            Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Rendu", style = MaterialTheme.typography.titleLarge)
+                SectionLabel("Exposition")
+                Text(
+                    "%+.1f EV".format(ev),
+                    style = MaterialTheme.typography.bodyMedium.tnum(),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Slider(
+                    value = ev,
+                    onValueChange = { v -> ev = (Math.round(v * 6f) / 6f); controller?.setExposureBias(ev) },
+                    valueRange = -ExposureMath.MAX_EV..ExposureMath.MAX_EV
+                )
+                SectionLabel("Style")
+                ChoiceRow(RenderLook.entries, look, { it.label }, { look = it; controller?.look = it })
+                SectionLabel("Qualité maximale")
+                Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Développement différé", style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            "Prend jusqu'à 12 trames selon la mémoire, puis fusionne et débruite plus fort en arrière-plan (batterie non faible requise). Réservé au RAW.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = deferred,
+                        onCheckedChange = { deferred = it; controller?.deferred = it },
+                        enabled = info.strategy == CaptureStrategy.RAW
+                    )
+                }
+                Text(
+                    "Le point noir, le contraste et la saturation sont appliqués à la fusion RAW ; l'exposition agit aussi sur le viseur.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
     }
 }

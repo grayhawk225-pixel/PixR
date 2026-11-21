@@ -83,4 +83,38 @@ class CameraLogicTest {
         assertEquals(4096 to 3072, SizePicker.pickRaw(sizes))
         assertEquals(1600 to 1200, SizePicker.pickPreview(sizes))
     }
+
+    @Test
+    fun renderToneAndExposure() {
+        assertEquals(1f, ExposureMath.evGain(0f), 1e-6f)
+        assertEquals(2f, ExposureMath.evGain(1f), 1e-5f)
+        // Pas AE de 1/3 EV : +1 EV -> indice 3, aucun reste numérique.
+        assertEquals(3, ExposureMath.compensationIndex(1f, 1f / 3f, -12, 12))
+        assertEquals(0f, ExposureMath.residualEv(1f, 1f / 3f, 3), 1e-5f)
+        // Plage limitée : l'indice est borné, le reste passe en numérique.
+        assertEquals(2, ExposureMath.compensationIndex(2f, 0.5f, -2, 2).coerceAtMost(2))
+        assertEquals(0.5f, ExposureMath.residualEv(1.5f, 0.5f, 2), 1e-5f)
+        // Capteur sans compensation (pas 0) : tout en numérique.
+        assertEquals(0, ExposureMath.compensationIndex(1f, 0f, 0, 0))
+        assertEquals(1f, ExposureMath.residualEv(1f, 0f, 0), 1e-6f)
+        val tone = ExposureMath.tone(RenderLook.NATURAL, 0f)
+        assertArrayEquals(floatArrayOf(1f, 0.35f, 1.10f, 0.35f), tone, 1e-6f)
+        assertTrue(RenderLook.VIVID.saturation > RenderLook.NATURAL.saturation)
+        assertTrue(RenderLook.SOFT.contrast < RenderLook.NATURAL.contrast)
+    }
+
+    @Test
+    fun deferredFrameCountFollowsMemory() {
+        val mb = 1024L * 1024L
+        // Pleine résolution à 1x : ~25 Mo par trame -> 240 Mo permettent 9 trames.
+        assertEquals(9, DeferredRules.frameCount(25 * mb, 240 * mb))
+        // Zoom fort : trames petites -> plafond de 12.
+        assertEquals(12, DeferredRules.frameCount(7 * mb, 240 * mb))
+        // Mémoire serrée : jamais moins que le minimum de la rafale normale.
+        assertEquals(6, DeferredRules.frameCount(60 * mb, 100 * mb))
+        assertEquals(6, DeferredRules.frameCount(0L, 100 * mb))
+        assertTrue(DeferredRules.DENOISE_DEFERRED > DeferredRules.DENOISE_IMMEDIATE)
+        assertEquals(4, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f).size)
+        assertEquals(0.8f, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f)[3], 1e-6f)
+    }
 }
