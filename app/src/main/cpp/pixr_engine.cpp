@@ -735,6 +735,25 @@ namespace {
 constexpr int kCfaColor[4][4] = {{0, 1, 1, 2}, {1, 0, 2, 1}, {1, 2, 0, 1}, {2, 1, 1, 0}};
 constexpr float kRawReject = 32.0f;  // écart de luminance (0..255) rejetant un échantillon en mouvement
 
+inline float lumaBilinearF(const float* L, int w, int h, float x, float y) {
+    x = clampf(x, 0.0f, static_cast<float>(w) - 1.001f);
+    y = clampf(y, 0.0f, static_cast<float>(h) - 1.001f);
+    const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
+    const float tx = x - x0, ty = y - y0;
+    const float* p = L + static_cast<size_t>(y0) * w + x0;
+    return (p[0] * (1 - tx) + p[1] * tx) * (1 - ty) + (p[w] * (1 - tx) + p[w + 1] * tx) * ty;
+}
+
+// Idem pour les plans de luminance 16 bits (x128).
+inline float lumaBilinearQ(const uint16_t* L, int w, int h, float x, float y) {
+    x = clampf(x, 0.0f, static_cast<float>(w) - 1.001f);
+    y = clampf(y, 0.0f, static_cast<float>(h) - 1.001f);
+    const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
+    const float tx = x - x0, ty = y - y0;
+    const uint16_t* p = L + static_cast<size_t>(y0) * w + x0;
+    return ((p[0] * (1 - tx) + p[1] * tx) * (1 - ty) + (p[w] * (1 - tx) + p[w + 1] * tx) * ty) * (1.0f / 128.0f);
+}
+
 // Débruitage déterministe préservant les contours (filtre bilatéral 5x5 sur luminance + chrominance).
 // Il ne fait que moyenner des pixels réels voisins de valeur proche : aucun détail n'est créé.
 // rgb : 3 flottants 0..255 par pixel (modifié en place) ; strength 0..1 ; tmp : tampon de travail.
@@ -895,6 +914,18 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
         denoise = std::min(std::max(d, 0.0f), 1.0f);
     }
     if (env->GetArrayLength(toneArr) >= 5) env->GetFloatArrayRegion(toneArr, 4, 1, &autoLevels);  // 0 : désactive l'exposition auto (tests)
+    // Bruit du capteur (profil Camera2 : variance = S·x + O, x normalisé 0..1) et accentuation de sortie.
+    float noiseS = 0.0f, noiseO = 0.0f, sharpArg = 0.0f;
+    if (env->GetArrayLength(toneArr) >= 8) {
+        env->GetFloatArrayRegion(toneArr, 6, 1, &noiseS);
+        env->GetFloatArrayRegion(toneArr, 7, 1, &noiseO);
+        if (!(noiseS >= 0.0f) || !(noiseO >= 0.0f)) { noiseS = 0.0f; noiseO = 0.0f; }
+    }
+    if (env->GetArrayLength(toneArr) >= 9) {
+        env->GetFloatArrayRegion(toneArr, 8, 1, &sharpArg);
+        sharpArg = std::min(std::max(sharpArg, 0.0f), 2.0f);
+    }
+    const bool haveNoise = noiseS > 0.0f || noiseO > 0.0f;
     float shadowLift = 0.0f;
     if (env->GetArrayLength(toneArr) >= 6) {
         env->GetFloatArrayRegion(toneArr, 5, 1, &shadowLift);
@@ -983,6 +1014,12 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
         for (int i = 0; i < kLutN; ++i)
             wlk[static_cast<size_t>(l) * kLutN + i] = std::exp(-(static_cast<float>(i) / 128.0f) / (2.0f * sg * sg));
     }
+    const float gainAvg = 0.25f * (ctx.gainIdx[0] + ctx.gainIdx[1] + ctx.gainIdx[2] + ctx.gainIdx[3]);
+    // Écart-type du bruit (en valeur normalisée 0..1, gains appliqués) d'un pixel de luminosité linéaire lumaLin255.
+    auto sigmaOfLuma = [&](float lumaLin255) {
+        const float x = clampf(lumaLin255 / 255.0f / std::max(gainAvg, 0.1f), 0.0f, 1.0f);
+        return gainAvg * std::sqrt(noiseS * x + noiseO);
+    };
     std::vector<uint8_t> levelMap(static_cast<size_t>(w2) * h2, 0);
     {
         // Mesure du détail sur les pixels BRUTS de même couleur (distance 2) : la réduction en luminance 2x2 efface
@@ -1007,19 +1044,30 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
             blur121(gmap, w2, h2, sm);
             gmap.swap(sm);
         }
-        std::vector<float> samp;
-        for (size_t i = 0; i < gmap.size(); i += 7) samp.push_back(gmap[i]);
-        std::nth_element(samp.begin(), samp.begin() + samp.size() / 6, samp.end());
-        const float gLo = std::max(1.5f, 1.5f * samp[samp.size() / 6]);
-        const float gHi = gLo + 7.0f;
+        // Seuils ABSOLUS tirés du bruit du capteur (et non des pixels les moins détaillés de l'image : sur une scène
+        // entièrement texturée, comme de l'herbe, tout aurait été classé « plat » et fortement flouté).
+        float gLoFallback = 1.5f, gHiFallback = 8.5f;
+        if (!haveNoise) {
+            std::vector<float> samp;
+            for (size_t i = 0; i < gmap.size(); i += 7) samp.push_back(gmap[i]);
+            std::nth_element(samp.begin(), samp.begin() + samp.size() / 6, samp.end());
+            gLoFallback = std::min(std::max(1.5f, 1.5f * samp[samp.size() / 6]), 4.0f);
+            gHiFallback = gLoFallback + 7.0f;
+        }
         for (size_t i = 0; i < gmap.size(); ++i) {
+            float gLo = gLoFallback, gHi = gHiFallback;
+            if (haveNoise) {
+                const float gn = std::min(170.0f * sigmaOfLuma(LR[i]), 12.0f);   // niveau du gradient dû au seul bruit (après lissage)
+                gLo = 0.9f * gn + 0.4f;
+                gHi = gLo + 3.0f * gn + 3.0f;
+            }
             const float t = clampf((gmap[i] - gLo) / (gHi - gLo), 0.0f, 1.0f);
             levelMap[i] = static_cast<uint8_t>(t * (kLevels - 1) + 0.5f);
         }
         if (benchEnv("PIXR_DEBUG")) {
             int hist[kLevels] = {0};
             for (uint8_t v : levelMap) ++hist[v];
-            std::fprintf(stderr, "niveaux de noyau (0=large..5=fin): gLo=%.2f gHi=%.2f", gLo, gHi);
+            std::fprintf(stderr, "niveaux de noyau (0=large..5=fin): repli: gLo=%.2f gHi=%.2f", gLoFallback, gHiFallback);
             for (int l = 0; l < kLevels; ++l) std::fprintf(stderr, " [%d]=%d", l, hist[l]);
             // zone du réseau fin (luma 20..95 x 20..75)
             int roi[kLevels] = {0};
@@ -1052,7 +1100,9 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
     }
 
     const float invF = 1.0f / static_cast<float>(factor);
-    const float sharpen = textMode ? 0.6f : 0.0f;
+    // Accentuation de sortie (réglable) : compense le flou inévitable du démosaïçage et du rééchantillonnage ; plus forte à ×2.
+    const float sharpen = std::max(sharpArg * (factor == 2 ? 1.25f : 1.0f), textMode ? 0.6f : 0.0f);
+    const float sharpTau = 1.5f + 10.0f * denoise;   // seuil doux : on n'accentue pas le bruit
     constexpr int tileSize = 128;
     const auto T1 = std::chrono::steady_clock::now();
     // Rayon au-delà duquel le poids du noyau est négligeable (< 0,4 %) : on saute ces échantillons.
@@ -1082,7 +1132,10 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                     const float pxf = static_cast<float>(crop[0]) + (static_cast<float>(rx0 + x) + 0.5f) * invF - 0.5f;
                     const int lbx = std::min(std::max(static_cast<int>(std::max(pxf, 0.0f)) >> 1, 0), w2 - 1);
                     const int bgx = std::min(std::max(static_cast<int>(std::max(pxf, 0.0f)) >> 5, 0), gbw - 1);
-                    const float refL = LR[static_cast<size_t>(lby) * w2 + lbx];
+                    // Luminance de référence au point exact (bilinéaire) et seuil de rejet adapté au bruit : à bas ISO, deux
+                    // images doivent concorder de près pour être fusionnées (sinon on étale les détails fins).
+                    const float refL = lumaBilinearF(LR.data(), w2, h2, (pxf - 0.5f) * 0.5f, (py - 0.5f) * 0.5f);
+                    const float rejectT = haveNoise ? clampf(5.7f * 255.0f * 0.52f * sigmaOfLuma(refL), 5.0f, kRawReject) : kRawReject;
                     const int lvl = levelMap[static_cast<size_t>(lby) * w2 + lbx];
                     float acc[3], ws[3];
                     auto gather = [&](const float* lutRow, float cutL) {
@@ -1096,11 +1149,9 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                             qy = py + 2.0f * m.dy;
                             if (qx < 0.0f || qy < 0.0f || qx > static_cast<float>(w - 1) || qy > static_cast<float>(h - 1))
                                 continue;
-                            const int kbx = std::min(static_cast<int>(qx) >> 1, w2 - 1);
-                            const int kby = std::min(static_cast<int>(qy) >> 1, h2 - 1);
-                            const float d = std::fabs(static_cast<float>(lumaQ[k][static_cast<size_t>(kby) * w2 + kbx]) * (1.0f / 128.0f) - refL);
-                            if (d >= kRawReject) continue;  // mouvement local : pas de fantôme
-                            const float q = d / kRawReject;
+                            const float d = std::fabs(lumaBilinearQ(lumaQ[k].data(), w2, h2, (qx - 0.5f) * 0.5f, (qy - 0.5f) * 0.5f) - refL);
+                            if (d >= rejectT) continue;  // mouvement local : pas de fantôme
+                            const float q = d / rejectT;
                             wk = (1.0f - q * q) * m.q;
                         }
                         // Fenêtre 4x4 autour de la position : constantes par parité (couleur, noir, échelle) hors boucle.
@@ -1166,7 +1217,10 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                     uint32_t c[3];
                     for (int ch = 0; ch < 3; ++ch) {
                         float val = buf[bi + ch];
-                        if (sharpen > 0.0f) val += sharpen * (val - lp[bi + ch]);
+                        if (sharpen > 0.0f) {
+                            const float dd = val - lp[bi + ch];
+                            val += sharpen * dd * (std::fabs(dd) / (std::fabs(dd) + sharpTau));
+                        }
                         c[ch] = static_cast<uint32_t>(clampf(val, 0.0f, 255.0f) + 0.5f);
                     }
                     out[(ty + y) * ow + (tx + x)] = static_cast<jint>(0xFF000000u | (c[0] << 16) | (c[1] << 8) | c[2]);

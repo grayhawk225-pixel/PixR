@@ -83,6 +83,7 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
     @Volatile private var ev = 0f
     @Volatile var look: RenderLook = RenderLook.NATURAL
     @Volatile var deferred = false
+    @Volatile var sharpness: Sharpness = Sharpness.NATURAL
     @Volatile private var lastPreview: TotalCaptureResult? = null
     private var pending: Pending? = null
 
@@ -304,7 +305,8 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
         val idx = aeIndex()
         val tone = ExposureMath.tone(
             look, ExposureMath.residualEv(ev, info.aeCompStep, idx),
-            if (defer) DeferredRules.DENOISE_DEFERRED else DeferredRules.DENOISE_IMMEDIATE
+            if (defer) DeferredRules.DENOISE_DEFERRED else DeferredRules.DENOISE_IMMEDIATE,
+            sharpness.amount
         )
         val p = Pending(n, region, rel, ZoomMath.outputFactor(zoomStep), textMode, displayRotation(), tone, defer, onDone)
         try {
@@ -479,6 +481,7 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
                     ?.let { arr -> DoubleArray(arr.size * 2) { if (it % 2 == 0) arr[it / 2].first else arr[it / 2].second } }
                 val tone = p.tone.copyOf()
                 tone[3] = NoiseModel.denoiseStrength(NoiseModel.sigmaMid255(noise), p.raw.size, p.deferred)
+                NoiseModel.meanSO(noise)?.let { (so, oo) -> tone[6] = so; tone[7] = oo }
                 val job = RawJob(
                     frames = ArrayList(p.raw),
                     w = p.region[2] - p.region[0],

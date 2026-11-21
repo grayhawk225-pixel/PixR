@@ -195,6 +195,9 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
         mutableStateOf(RenderLook.entries.firstOrNull { it.name == prefs.getString("look", null) } ?: RenderLook.NATURAL)
     }
     var showRender by remember { mutableStateOf(false) }
+    var sharpness by remember {
+        mutableStateOf(Sharpness.entries.firstOrNull { it.name == prefs.getString("sharp", null) } ?: Sharpness.CRISP)
+    }
     // Développement différé par défaut sur RAW : prise rapide, fusion et débruitage poussés en arrière-plan.
     var deferred by remember { mutableStateOf(info.strategy == CaptureStrategy.RAW && prefs.getBoolean("deferred", true)) }
     var showDevelop by remember { mutableStateOf(false) }
@@ -231,6 +234,7 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
             c.setZoom(zoom)
             c.setExposureBias(ev)
             c.look = look
+            c.sharpness = sharpness
             c.deferred = deferred
             c.start(t) { status = UiStatus(it, StatusKind.ERROR); busy = false }
             controller = c
@@ -367,6 +371,8 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
                         enabled = info.strategy == CaptureStrategy.RAW
                     )
                 }
+                SectionLabel("Netteté")
+                ChoiceRow(Sharpness.entries, sharpness, { it.label }, { sharpness = it; controller?.sharpness = it; prefs.edit().putString("sharp", it.name).apply() })
                 Text(
                     "Le point noir, le contraste et la saturation sont appliqués à la fusion RAW ; l'exposition agit aussi sur le viseur.",
                     style = MaterialTheme.typography.bodySmall,

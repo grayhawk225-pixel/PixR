@@ -98,7 +98,7 @@ class CameraLogicTest {
         assertEquals(0, ExposureMath.compensationIndex(1f, 0f, 0, 0))
         assertEquals(1f, ExposureMath.residualEv(1f, 0f, 0), 1e-6f)
         val tone = ExposureMath.tone(RenderLook.NATURAL, 0f)
-        assertArrayEquals(floatArrayOf(1f, 0.35f, 1.10f, 0.35f, 1f, 0.35f), tone, 1e-6f)
+        assertArrayEquals(floatArrayOf(1f, 0.35f, 1.10f, 0.35f, 1f, 0.35f, 0f, 0f, 0.9f), tone, 1e-6f)
         assertTrue(RenderLook.VIVID.saturation > RenderLook.NATURAL.saturation)
         assertTrue(RenderLook.SOFT.contrast < RenderLook.NATURAL.contrast)
     }
@@ -114,7 +114,7 @@ class CameraLogicTest {
         assertEquals(6, DeferredRules.frameCount(60 * mb, 100 * mb))
         assertEquals(6, DeferredRules.frameCount(0L, 100 * mb))
         assertTrue(DeferredRules.DENOISE_DEFERRED > DeferredRules.DENOISE_IMMEDIATE)
-        assertEquals(6, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f).size)
+        assertEquals(9, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f).size)
         assertEquals(0.8f, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f)[3], 1e-6f)
     }
 
@@ -151,5 +151,21 @@ class CameraLogicTest {
         // Première image gardée quand le gain est négligeable.
         assertEquals(0, FrameQuality.pickReference(listOf(sharp, frame(79)), w, h))
         assertEquals(0, FrameQuality.pickReference(listOf(blurry), w, h))
+    }
+
+    @Test
+    fun sharpnessAndNoiseProfile() {
+        assertTrue(Sharpness.SOFT.amount < Sharpness.NATURAL.amount)
+        assertTrue(Sharpness.NATURAL.amount < Sharpness.CRISP.amount)
+        assertEquals(1.3f, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.2f, Sharpness.CRISP.amount)[8], 1e-6f)
+        val so = NoiseModel.meanSO(doubleArrayOf(0.002, 4e-5, 0.004, 6e-5, 0.004, 6e-5, 0.006, 8e-5))!!
+        assertEquals(0.004f, so.first, 1e-6f)
+        assertEquals(6e-5f, so.second, 1e-9f)
+        assertEquals(null, NoiseModel.meanSO(doubleArrayOf(0.002)))
+        assertEquals(null, NoiseModel.meanSO(doubleArrayOf(-0.002, 1e-5)))
+        assertEquals(null, NoiseModel.meanSO(null))
+        // Échelle aberrante (variance énorme) : ignorée.
+        assertEquals(null, NoiseModel.meanSO(doubleArrayOf(5.0, 1.0)))
+        assertEquals(null, NoiseModel.meanSO(doubleArrayOf(0.0, 0.0)))
     }
 }

@@ -280,6 +280,13 @@ enum class RenderLook(val label: String, val contrast: Float, val saturation: Fl
     SOFT("Doux", 0.15f, 1.00f, 0.50f)
 }
 
+/** Accentuation de sortie (netteté perçue) : compense le flou du démosaïçage et de l'agrandissement. */
+enum class Sharpness(val label: String, val amount: Float) {
+    SOFT("Douce", 0.5f),
+    NATURAL("Naturelle", 0.9f),
+    CRISP("Nette", 1.3f)
+}
+
 object ExposureMath {
     const val MAX_EV = 2f
 
@@ -294,10 +301,11 @@ object ExposureMath {
 
     /**
      * Paramètres de rendu pour le moteur natif :
-     * [gain d'exposition numérique, contraste, saturation, débruitage 0..1, exposition auto (1 = oui), remontée des ombres 0..1].
+     * [gain d'exposition numérique, contraste, saturation, débruitage 0..1, exposition auto (1 = oui), remontée des ombres 0..1,
+     *  bruit S, bruit O (profil Camera2, 0 = inconnu), accentuation de sortie].
      */
-    fun tone(look: RenderLook, residualEv: Float, denoise: Float = 0.35f): FloatArray =
-        floatArrayOf(evGain(residualEv), look.contrast, look.saturation, denoise, 1f, look.shadows)
+    fun tone(look: RenderLook, residualEv: Float, denoise: Float = 0.35f, sharpness: Float = Sharpness.NATURAL.amount): FloatArray =
+        floatArrayOf(evGain(residualEv), look.contrast, look.saturation, denoise, 1f, look.shadows, 0f, 0f, sharpness)
 }
 
 /** Force du débruitage déduite du bruit RÉEL du capteur (profil Camera2) et du nombre d'images fusionnées. */
@@ -317,6 +325,25 @@ object NoiseModel {
             n++
         }
         return if (n == 0) null else sum / n * 255.0
+    }
+
+    /** Moyenne des couples (S, O) du profil : le moteur s'en sert pour distinguer détail et bruit, et régler le rejet de mouvement. */
+    fun meanSO(profile: DoubleArray?): Pair<Float, Float>? {
+        if (profile == null || profile.size < 2 || profile.size % 2 != 0) return null
+        var s = 0.0
+        var o = 0.0
+        val n = profile.size / 2
+        for (i in 0 until n) {
+            val si = profile[2 * i]
+            val oi = profile[2 * i + 1]
+            if (!si.isFinite() || !oi.isFinite() || si < 0.0 || oi < 0.0) return null
+            s += si
+            o += oi
+        }
+        // Profil aberrant (mauvaise échelle du fabricant) : mieux vaut l'ignorer que de tout flouter à tort.
+        val sigmaMid = Math.sqrt(s / n * 0.2 + o / n) * 255.0
+        if (!sigmaMid.isFinite() || sigmaMid < 0.05 || sigmaMid > 60.0) return null
+        return (s / n).toFloat() to (o / n).toFloat()
     }
 
     /** Bruit résiduel après fusion de [frames] images : l'écart-type diminue comme 1/√N. */
