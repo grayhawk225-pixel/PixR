@@ -475,6 +475,10 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
                 )
                 val resultCcm = res.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)?.let { toMatrix(it) }
                 val ccm = ColorMath.resolveCcm(if (ColorMath.isNearIdentity(resultCcm)) null else resultCcm, info.forwardMatrix)
+                val noise = res.get(CaptureResult.SENSOR_NOISE_PROFILE)
+                    ?.let { arr -> DoubleArray(arr.size * 2) { if (it % 2 == 0) arr[it / 2].first else arr[it / 2].second } }
+                val tone = p.tone.copyOf()
+                tone[3] = NoiseModel.denoiseStrength(NoiseModel.sigmaMid255(noise), p.raw.size, p.deferred)
                 val job = RawJob(
                     frames = ArrayList(p.raw),
                     w = p.region[2] - p.region[0],
@@ -487,7 +491,7 @@ class CameraBurstController(context: Context, private val info: CameraInfo) {
                     factor = p.factor,
                     relCrop = p.relCrop,
                     textMode = p.textMode,
-                    tone = p.tone,
+                    tone = tone,
                     rotationDeg = rot,
                     exif = exif
                 )

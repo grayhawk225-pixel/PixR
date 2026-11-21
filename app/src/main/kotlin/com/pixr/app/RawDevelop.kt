@@ -1,6 +1,16 @@
 package com.pixr.app
 
+import android.Manifest
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.ContextCompat
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import androidx.work.Constraints
@@ -43,8 +53,11 @@ object RawDeveloper {
     fun develop(context: Context, job: RawJob): CameraOutcome {
         return try {
             check(NativeEngine.available) { "Moteur natif indisponible" }
+            // Référence = image la plus nette : les autres s'alignent sur elle.
+            val ref = FrameQuality.pickReference(job.frames, job.w, job.h)
+            val ordered = if (ref == 0) job.frames else listOf(job.frames[ref]) + job.frames.filterIndexed { i, _ -> i != ref }
             val pixels = NativeEngine.fuseRawBurst(
-                job.frames.toTypedArray(), job.w, job.h, job.cfa, job.blacks, job.white,
+                ordered.toTypedArray(), job.w, job.h, job.cfa, job.blacks, job.white,
                 job.gains, job.ccm, job.factor, job.relCrop, job.textMode, job.tone
             ) ?: error("Fusion RAW refusée par le moteur")
             val ow = (job.relCrop[2] - job.relCrop[0]) * job.factor
@@ -140,25 +153,90 @@ object RawJobStore {
     }
 }
 
+/** Journal court des derniers développements (persistant), affiché dans la feuille « Développements » de la caméra. */
+object DevelopLog {
+    data class Entry(val time: Long, val ok: Boolean, val message: String)
+
+    private const val PREFS = "pixr_develop_log"
+    private const val KEY = "entries"
+    private const val MAX = 12
+
+    fun add(context: Context, ok: Boolean, message: String) {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val line = "${System.currentTimeMillis()}\u001f${if (ok) 1 else 0}\u001f${message.replace('\u001e', ' ').replace('\u001f', ' ')}"
+        val all = (listOf(line) + (prefs.getString(KEY, "")?.split('\u001e')?.filter { it.isNotEmpty() } ?: emptyList())).take(MAX)
+        prefs.edit().putString(KEY, all.joinToString("\u001e")).apply()
+    }
+
+    fun recent(context: Context): List<Entry> =
+        (context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY, "") ?: "")
+            .split('\u001e').filter { it.isNotEmpty() }
+            .mapNotNull { l ->
+                val f = l.split('\u001f')
+                if (f.size < 3) null else Entry(f[0].toLongOrNull() ?: 0L, f[1] == "1", f[2])
+            }
+}
+
+/** Notification de fin de développement (silencieuse si la permission n'a pas été accordée). */
+object DevelopNotifier {
+    private const val CHANNEL = "pixr_develop"
+
+    fun notifyDone(context: Context, done: Int, failed: Int) {
+        if (done + failed == 0) return
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) return
+        val nm = NotificationManagerCompat.from(context)
+        if (!nm.areNotificationsEnabled()) return
+        if (Build.VERSION.SDK_INT >= 26) {
+            val mgr = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            mgr.createNotificationChannel(NotificationChannel(CHANNEL, "Développement des photos", NotificationManager.IMPORTANCE_DEFAULT))
+        }
+        val open = PendingIntent.getActivity(
+            context, 0, Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val text = if (failed == 0) {
+            if (done == 1) "1 photo développée, enregistrée dans Pictures/PixR." else "$done photos développées, enregistrées dans Pictures/PixR."
+        } else "$done développée(s), $failed en échec."
+        val n = NotificationCompat.Builder(context, CHANNEL)
+            .setSmallIcon(android.R.drawable.stat_notify_more)
+            .setContentTitle("PixR : développement terminé")
+            .setContentText(text)
+            .setContentIntent(open)
+            .setAutoCancel(true)
+            .build()
+        try {
+            nm.notify(4242, n)
+        } catch (_: SecurityException) {
+        }
+    }
+}
+
 /** Développe les rafales en attente, une par une, en respectant les mêmes règles batterie/chauffe que le lot. */
 class PixRDevelopWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.Default) {
         var done = 0
         var failed = 0
+        var index = 0
         while (true) {
             val next = RawJobStore.pending(applicationContext).firstOrNull() ?: break
             val b = DeviceState.battery(applicationContext)
             val pause = BatchRules.pauseReason(b.percent, b.charging, DeviceState.thermalStatus(applicationContext))
             if (pause != null) return@withContext Result.retry()
-            val ok = try {
-                RawDeveloper.develop(applicationContext, RawJobStore.read(next)).success
-            } catch (_: Throwable) {
-                false
+            index++
+            setProgress(workDataOf("index" to index, "queued" to RawJobStore.pending(applicationContext).size))
+            val outcome = try {
+                RawDeveloper.develop(applicationContext, RawJobStore.read(next))
+            } catch (t: Throwable) {
+                CameraOutcome(false, "Échec : ${t.message}", null, null)
             }
             // Une rafale qui échoue (fichier corrompu, mémoire) est retirée : pas de boucle infinie.
             next.delete()
-            if (ok) done++ else failed++
+            DevelopLog.add(applicationContext, outcome.success, outcome.message)
+            if (outcome.success) done++ else failed++
         }
+        DevelopNotifier.notifyDone(applicationContext, done, failed)
         Result.success(workDataOf("done" to done, "failed" to failed))
     }
 }

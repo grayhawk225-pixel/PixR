@@ -98,7 +98,7 @@ class CameraLogicTest {
         assertEquals(0, ExposureMath.compensationIndex(1f, 0f, 0, 0))
         assertEquals(1f, ExposureMath.residualEv(1f, 0f, 0), 1e-6f)
         val tone = ExposureMath.tone(RenderLook.NATURAL, 0f)
-        assertArrayEquals(floatArrayOf(1f, 0.35f, 1.10f, 0.35f), tone, 1e-6f)
+        assertArrayEquals(floatArrayOf(1f, 0.35f, 1.10f, 0.35f, 1f, 0.35f), tone, 1e-6f)
         assertTrue(RenderLook.VIVID.saturation > RenderLook.NATURAL.saturation)
         assertTrue(RenderLook.SOFT.contrast < RenderLook.NATURAL.contrast)
     }
@@ -114,7 +114,42 @@ class CameraLogicTest {
         assertEquals(6, DeferredRules.frameCount(60 * mb, 100 * mb))
         assertEquals(6, DeferredRules.frameCount(0L, 100 * mb))
         assertTrue(DeferredRules.DENOISE_DEFERRED > DeferredRules.DENOISE_IMMEDIATE)
-        assertEquals(4, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f).size)
+        assertEquals(6, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f).size)
         assertEquals(0.8f, ExposureMath.tone(RenderLook.NATURAL, 0f, 0.8f)[3], 1e-6f)
+    }
+
+    @Test
+    fun noiseModelDrivesDenoise() {
+        // Profil du banc de test (400 e- à saturation, lecture 3 e-) : S = 1/400, O = 9/400² -> sigma ≈ 6 sur 255 à x = 0,2.
+        val s = NoiseModel.sigmaMid255(doubleArrayOf(0.0025, 5.625e-5, 0.0025, 5.625e-5))!!
+        assertEquals(6.0, s, 0.1)
+        // Plus il y a d'images, moins il faut de débruitage ; le mode différé en demande davantage.
+        val few = NoiseModel.denoiseStrength(s, 2, false)
+        val many = NoiseModel.denoiseStrength(s, 12, false)
+        assertTrue(few > many)
+        assertTrue(NoiseModel.denoiseStrength(s, 8, true) > NoiseModel.denoiseStrength(s, 8, false))
+        assertEquals(0.40f, NoiseModel.denoiseStrength(s, 8, false), 0.02f)
+        // Une scène peu bruitée (forte lumière) reste faiblement débruitée.
+        val bright = NoiseModel.sigmaMid255(doubleArrayOf(1.0 / 6000, 9.0 / 36e6))!!
+        assertTrue(NoiseModel.denoiseStrength(bright, 8, false) < 0.25f)
+        // Profil absent ou invalide : valeurs par défaut.
+        assertEquals(DeferredRules.DENOISE_IMMEDIATE, NoiseModel.denoiseStrength(null, 8, false), 1e-6f)
+        assertEquals(null, NoiseModel.sigmaMid255(doubleArrayOf(1.0)))
+        assertEquals(null, NoiseModel.sigmaMid255(doubleArrayOf(-1.0, -1.0)))
+    }
+
+    @Test
+    fun sharpestFrameBecomesReference() {
+        val w = 64
+        val h = 64
+        fun frame(contrast: Int) = ShortArray(w * h) { i -> (500 + if (((i % w) / 2 + (i / w) / 2) % 2 == 0) contrast else -contrast).toShort() }
+        val blurry = frame(5)
+        val sharp = frame(80)
+        val mid = frame(30)
+        assertTrue(FrameQuality.sharpness(sharp, w, h) > FrameQuality.sharpness(mid, w, h))
+        assertEquals(1, FrameQuality.pickReference(listOf(blurry, sharp, mid), w, h))
+        // Première image gardée quand le gain est négligeable.
+        assertEquals(0, FrameQuality.pickReference(listOf(sharp, frame(79)), w, h))
+        assertEquals(0, FrameQuality.pickReference(listOf(blurry), w, h))
     }
 }

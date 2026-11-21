@@ -274,10 +274,10 @@ object CameraExifFormat {
 }
 
 /** Rendu de sortie : contraste (courbe en S) et saturation, appliqués après l'exposition automatique douce. */
-enum class RenderLook(val label: String, val contrast: Float, val saturation: Float) {
-    NATURAL("Naturel", 0.35f, 1.10f),
-    VIVID("Éclatant", 0.60f, 1.25f),
-    SOFT("Doux", 0.15f, 1.00f)
+enum class RenderLook(val label: String, val contrast: Float, val saturation: Float, val shadows: Float) {
+    NATURAL("Naturel", 0.35f, 1.10f, 0.35f),
+    VIVID("Éclatant", 0.60f, 1.25f, 0.25f),
+    SOFT("Doux", 0.15f, 1.00f, 0.50f)
 }
 
 object ExposureMath {
@@ -292,7 +292,71 @@ object ExposureMath {
     /** EV restant à appliquer numériquement une fois la compensation AE (par pas) retirée. */
     fun residualEv(ev: Float, step: Float, index: Int): Float = if (step <= 0f) ev else ev - index * step
 
-    /** Paramètres de rendu pour le moteur natif : [gain d'exposition numérique, contraste, saturation, débruitage 0..1]. */
+    /**
+     * Paramètres de rendu pour le moteur natif :
+     * [gain d'exposition numérique, contraste, saturation, débruitage 0..1, exposition auto (1 = oui), remontée des ombres 0..1].
+     */
     fun tone(look: RenderLook, residualEv: Float, denoise: Float = 0.35f): FloatArray =
-        floatArrayOf(evGain(residualEv), look.contrast, look.saturation, denoise)
+        floatArrayOf(evGain(residualEv), look.contrast, look.saturation, denoise, 1f, look.shadows)
+}
+
+/** Force du débruitage déduite du bruit RÉEL du capteur (profil Camera2) et du nombre d'images fusionnées. */
+object NoiseModel {
+    /**
+     * [profile] = [S0, O0, S1, O1, ...] (Camera2 SENSOR_NOISE_PROFILE) : variance(x) = S·x + O, x = valeur normalisée 0..1.
+     * Retourne l'écart-type moyen des canaux à luminosité [x], sur l'échelle 0..255, ou null si le profil est inutilisable.
+     */
+    fun sigmaMid255(profile: DoubleArray?, x: Double = 0.2): Double? {
+        if (profile == null || profile.size < 2 || profile.size % 2 != 0) return null
+        var sum = 0.0
+        var n = 0
+        for (i in profile.indices step 2) {
+            val v = profile[i] * x + profile[i + 1]
+            if (!v.isFinite() || v < 0.0) return null
+            sum += Math.sqrt(v)
+            n++
+        }
+        return if (n == 0) null else sum / n * 255.0
+    }
+
+    /** Bruit résiduel après fusion de [frames] images : l'écart-type diminue comme 1/√N. */
+    fun denoiseStrength(sigmaMid255: Double?, frames: Int, deferred: Boolean): Float {
+        val base = if (deferred) DeferredRules.DENOISE_DEFERRED else DeferredRules.DENOISE_IMMEDIATE
+        if (sigmaMid255 == null || frames < 1) return base
+        val residual = sigmaMid255 / Math.sqrt(frames.toDouble())
+        val s = (0.15 + 0.12 * residual).coerceIn(0.10, 0.80)
+        return (if (deferred) s * 1.4 else s).coerceIn(0.10, 0.90).toFloat()
+    }
+}
+
+/** Choix de l'image de référence : la plus nette (comme Google et Samsung), pas simplement la première. */
+object FrameQuality {
+    /** Énergie de gradient entre pixels de même couleur (distance 2), échantillonnée : plus haut = plus net. */
+    fun sharpness(frame: ShortArray, w: Int, h: Int): Double {
+        var acc = 0.0
+        var n = 0
+        var y = 4
+        while (y < h - 4) {
+            var x = 4
+            while (x < w - 4) {
+                val a = frame[y * w + x].toInt() and 0xFFFF
+                val b = frame[y * w + x + 2].toInt() and 0xFFFF
+                val c = frame[(y + 2) * w + x].toInt() and 0xFFFF
+                acc += Math.abs(a - b) + Math.abs(a - c)
+                n++
+                x += 5
+            }
+            y += 5
+        }
+        return if (n == 0) 0.0 else acc / n
+    }
+
+    /** Indice de la meilleure référence ; garde la première image sauf gain net (> 2 %), pour ne pas réordonner pour rien. */
+    fun pickReference(frames: List<ShortArray>, w: Int, h: Int): Int {
+        if (frames.size < 2) return 0
+        val scores = frames.map { sharpness(it, w, h) }
+        var best = 0
+        for (i in 1 until scores.size) if (scores[i] > scores[best]) best = i
+        return if (scores[best] > scores[0] * 1.02) best else 0
+    }
 }

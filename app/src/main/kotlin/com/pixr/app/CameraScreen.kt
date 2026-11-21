@@ -39,10 +39,14 @@ import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Description
 import androidx.compose.material.icons.rounded.Error
+import androidx.compose.material.icons.rounded.HourglassTop
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.Warning
 import androidx.compose.material3.Button
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Slider
@@ -56,7 +60,10 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -77,6 +84,11 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 @Composable
 fun CameraScreen(onOpenAtelier: () -> Unit) {
@@ -177,10 +189,29 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
     var zoom by remember { mutableFloatStateOf(1f) }
     var textMode by remember { mutableStateOf(false) }
     var thumb by remember { mutableStateOf<Bitmap?>(null) }
-    var ev by remember { mutableFloatStateOf(0f) }
-    var look by remember { mutableStateOf(RenderLook.NATURAL) }
+    val prefs = remember { context.getSharedPreferences("pixr_camera_prefs", Context.MODE_PRIVATE) }
+    var ev by remember { mutableFloatStateOf(prefs.getFloat("ev", 0f)) }
+    var look by remember {
+        mutableStateOf(RenderLook.entries.firstOrNull { it.name == prefs.getString("look", null) } ?: RenderLook.NATURAL)
+    }
     var showRender by remember { mutableStateOf(false) }
-    var deferred by remember { mutableStateOf(false) }
+    // Développement différé par défaut sur RAW : prise rapide, fusion et débruitage poussés en arrière-plan.
+    var deferred by remember { mutableStateOf(info.strategy == CaptureStrategy.RAW && prefs.getBoolean("deferred", true)) }
+    var showDevelop by remember { mutableStateOf(false) }
+    var queued by remember { mutableIntStateOf(RawJobStore.pending(context).size) }
+    val workInfos by WorkManager.getInstance(context).getWorkInfosForUniqueWorkFlow("pixr_develop").collectAsState(initial = emptyList())
+    val running = workInfos.any { it.state == WorkInfo.State.RUNNING }
+    val notifLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    LaunchedEffect(workInfos) { queued = RawJobStore.pending(context).size }
+    // Demande unique de la permission de notification (Android 13+) : sert à prévenir quand un développement est fini.
+    LaunchedEffect(Unit) {
+        if (deferred && android.os.Build.VERSION.SDK_INT >= 33 && !prefs.getBoolean("notif_asked", false) &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            prefs.edit().putBoolean("notif_asked", true).apply()
+            notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     val owner = LocalLifecycleOwner.current
     DisposableEffect(owner) {
@@ -273,6 +304,7 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
                         val started = controller?.capture(zoom, textMode) { out ->
                             busy = false
                             status = UiStatus(out.message, if (out.success) StatusKind.SUCCESS else StatusKind.ERROR)
+                            queued = RawJobStore.pending(context).size
                             if (out.thumbnail != null) thumb = out.thumbnail
                         } ?: false
                         if (started) { busy = true; status = UiStatus("Rafale en cours…") }
@@ -282,7 +314,11 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
             ) {
                 if (busy) Icon(Icons.Outlined.PhotoCamera, contentDescription = null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            Box(Modifier.size(56.dp))
+            IconButton(onClick = { showDevelop = true }, modifier = Modifier.size(56.dp)) {
+                BadgedBox(badge = { if (queued > 0) Badge { Text("$queued") } }) {
+                    Icon(Icons.Rounded.HourglassTop, contentDescription = "Développements en arrière-plan : $queued en attente")
+                }
+            }
         }
         StatusLine(status)
     }
@@ -303,11 +339,11 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
                 )
                 Slider(
                     value = ev,
-                    onValueChange = { v -> ev = (Math.round(v * 6f) / 6f); controller?.setExposureBias(ev) },
+                    onValueChange = { v -> ev = (Math.round(v * 6f) / 6f); controller?.setExposureBias(ev); prefs.edit().putFloat("ev", ev).apply() },
                     valueRange = -ExposureMath.MAX_EV..ExposureMath.MAX_EV
                 )
                 SectionLabel("Style")
-                ChoiceRow(RenderLook.entries, look, { it.label }, { look = it; controller?.look = it })
+                ChoiceRow(RenderLook.entries, look, { it.label }, { look = it; controller?.look = it; prefs.edit().putString("look", it.name).apply() })
                 SectionLabel("Qualité maximale")
                 Row(Modifier.fillMaxWidth().heightIn(min = 48.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Column(Modifier.weight(1f)) {
@@ -320,7 +356,14 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
                     }
                     Switch(
                         checked = deferred,
-                        onCheckedChange = { deferred = it; controller?.deferred = it },
+                        onCheckedChange = {
+                            deferred = it
+                            controller?.deferred = it
+                            prefs.edit().putBoolean("deferred", it).apply()
+                            if (it && android.os.Build.VERSION.SDK_INT >= 33 &&
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                            ) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        },
                         enabled = info.strategy == CaptureStrategy.RAW
                     )
                 }
@@ -329,6 +372,38 @@ private fun ColumnScope.LiveCamera(info: CameraInfo, onOpenAtelier: () -> Unit) 
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+        }
+    }
+
+    if (showDevelop) {
+        val log = remember(showDevelop, workInfos, queued) { DevelopLog.recent(context) }
+        ModalBottomSheet(
+            onDismissRequest = { showDevelop = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
+        ) {
+            Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Développements", style = MaterialTheme.typography.titleLarge)
+                StatusLine(
+                    UiStatus(
+                        when {
+                            running -> "Développement en cours… $queued rafale(s) restante(s)."
+                            queued > 0 -> "$queued rafale(s) en attente (reprise quand la batterie et la température le permettent)."
+                            else -> "Aucune rafale en attente."
+                        }
+                    )
+                )
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+                if (log.isEmpty()) {
+                    Text("Aucun développement terminé pour l'instant.", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    val fmt = remember { SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()) }
+                    log.forEach { e ->
+                        Text(fmt.format(Date(e.time)), style = MaterialTheme.typography.labelMedium.tnum(), color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        StatusLine(UiStatus(e.message, if (e.ok) StatusKind.SUCCESS else StatusKind.ERROR))
+                    }
+                }
             }
         }
     }

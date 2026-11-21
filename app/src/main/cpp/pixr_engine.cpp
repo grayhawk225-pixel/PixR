@@ -7,6 +7,17 @@
 #include <cstdint>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
+#include <chrono>
+#include <thread>
+#include <atomic>
+
+#ifdef PIXR_BENCH
+// Réglages de test (banc sur PC uniquement) : variables d'environnement lues seulement si compilé avec -DPIXR_BENCH.
+static const char* benchEnv(const char* name) { return std::getenv(name); }
+#else
+static const char* benchEnv(const char*) { return nullptr; }
+#endif
 
 namespace {
 
@@ -162,7 +173,11 @@ inline float lumaOf(uint32_t c) {
 struct Motion {
     float dx = 0.0f, dy = 0.0f;
     bool ok = false;
+    float q = 1.0f;  // confiance 0..1 de l'alignement du bloc (poids de la trame dans la fusion)
 };
+
+void refineMotionGlobal(const std::vector<float>& LR, const std::vector<float>& LF, int w, int h,
+                        std::vector<Motion>& motion, int gbw, int gbh);
 
 constexpr int kFineBlock = 16;
 constexpr int kCoarseBlock = 8;
@@ -268,6 +283,256 @@ void computeMotion(const std::vector<float>& LR, const std::vector<float>& LF, i
             m.dx = static_cast<float>(gx + bi - kFineRange) + ox;
             m.dy = static_cast<float>(gy + bj - kFineRange) + oy;
             m.ok = best < kBlockSadMax;
+        }
+    refineMotionGlobal(LR, LF, w, h, motion, gbw, gbh);
+    if (benchEnv("PIXR_DEBUG")) { const Motion& m = motion[static_cast<size_t>(std::min(3, gbh - 1)) * gbw + std::min(8, gbw - 1)]; std::fprintf(stderr, "  bloc contour(8,3): dx=%.3f dy=%.3f ok=%d\n", m.dx, m.dy, m.ok); }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Recalage global sous-pixel (Lucas-Kanade) : le tremblement de la main est surtout un mouvement GLOBAL
+// (translation + légère rotation). L'estimer sur tous les pixels texturés, plutôt que bloc par bloc, donne une
+// précision de l'ordre du centième de pixel, insensible au bruit, et sans le piège des zones plates (où la
+// recherche par blocs ne peut rien dire) ni de l'ambiguïté le long d'un contour droit.
+// Les blocs dont le contenu ne colle pas au modèle global (objet en mouvement) gardent leur propre mouvement
+// s'il est plausible, sinon sont rejetés (aucun fantôme).
+// ---------------------------------------------------------------------------------------------
+// Flou par boîte séparable (rayon r, deux passes ~ gaussienne) pour la carte de luminosité locale.
+void boxBlurPlane(std::vector<float>& img, int w, int h, int r) {
+    if (r < 1 || w < 2 || h < 2) return;
+    std::vector<float> tmp(img.size());
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int y = 0; y < h; ++y) {  // horizontal
+            double acc = 0.0;
+            const float* row = &img[static_cast<size_t>(y) * w];
+            for (int x = -r; x <= r; ++x) acc += row[std::min(std::max(x, 0), w - 1)];
+            for (int x = 0; x < w; ++x) {
+                tmp[static_cast<size_t>(y) * w + x] = static_cast<float>(acc / (2 * r + 1));
+                acc += row[std::min(x + r + 1, w - 1)] - row[std::max(x - r, 0)];
+            }
+        }
+        for (int x = 0; x < w; ++x) {  // vertical
+            double acc = 0.0;
+            for (int y = -r; y <= r; ++y) acc += tmp[static_cast<size_t>(std::min(std::max(y, 0), h - 1)) * w + x];
+            for (int y = 0; y < h; ++y) {
+                img[static_cast<size_t>(y) * w + x] = static_cast<float>(acc / (2 * r + 1));
+                acc += tmp[static_cast<size_t>(std::min(y + r + 1, h - 1)) * w + x] - tmp[static_cast<size_t>(std::max(y - r, 0)) * w + x];
+            }
+        }
+    }
+}
+
+void blur121(const std::vector<float>& src, int w, int h, std::vector<float>& dst) {
+    std::vector<float> tmp(src.size());
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x) {
+            const int xm = std::max(x - 1, 0), xp = std::min(x + 1, w - 1);
+            tmp[static_cast<size_t>(y) * w + x] = 0.25f * src[static_cast<size_t>(y) * w + xm] +
+                                                  0.5f * src[static_cast<size_t>(y) * w + x] +
+                                                  0.25f * src[static_cast<size_t>(y) * w + xp];
+        }
+    dst.resize(src.size());
+    for (int y = 0; y < h; ++y) {
+        const int ym = std::max(y - 1, 0), yp = std::min(y + 1, h - 1);
+        for (int x = 0; x < w; ++x)
+            dst[static_cast<size_t>(y) * w + x] = 0.25f * tmp[static_cast<size_t>(ym) * w + x] +
+                                                  0.5f * tmp[static_cast<size_t>(y) * w + x] +
+                                                  0.25f * tmp[static_cast<size_t>(yp) * w + x];
+    }
+}
+
+inline float bilin(const float* L, int w, int h, float x, float y) {
+    x = clampf(x, 0.0f, static_cast<float>(w) - 1.001f);
+    y = clampf(y, 0.0f, static_cast<float>(h) - 1.001f);
+    const int x0 = static_cast<int>(x), y0 = static_cast<int>(y);
+    const float tx = x - x0, ty = y - y0;
+    const float* p = L + static_cast<size_t>(y0) * w + x0;
+    return (p[0] * (1 - tx) + p[1] * tx) * (1 - ty) + (p[w] * (1 - tx) + p[w + 1] * tx) * ty;
+}
+
+// Résout M x = r (n <= 6) par élimination de Gauss avec pivot partiel. Retourne false si singulier.
+bool solveSmall(double M[6][7], int n) {
+    for (int c = 0; c < n; ++c) {
+        int piv = c;
+        for (int r = c + 1; r < n; ++r) if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+        if (std::fabs(M[piv][c]) < 1e-9) return false;
+        if (piv != c) for (int j = 0; j <= n; ++j) std::swap(M[c][j], M[piv][j]);
+        for (int r = 0; r < n; ++r) {
+            if (r == c) continue;
+            const double f = M[r][c] / M[c][c];
+            for (int j = c; j <= n; ++j) M[r][j] -= f * M[c][j];
+        }
+    }
+    for (int c = 0; c < n; ++c) M[c][n] /= M[c][c];
+    return true;
+}
+
+float blockSadFrac(const float* A, const float* B, int w, int h, int x0, int y0, int bs, float dx, float dy) {
+    float acc = 0.0f;
+    int cnt = 0;
+    for (int y = y0; y < std::min(y0 + bs, h); y += 2)
+        for (int x = x0; x < std::min(x0 + bs, w); x += 2) {
+            acc += std::fabs(bilin(B, w, h, x + dx, y + dy) - A[static_cast<size_t>(y) * w + x]);
+            ++cnt;
+        }
+    return cnt > 0 ? acc / cnt : 1e9f;
+}
+
+void refineMotionGlobal(const std::vector<float>& LR, const std::vector<float>& LF, int w, int h,
+                        std::vector<Motion>& motion, int gbw, int gbh) {
+    if (benchEnv("PIXR_NO_REG")) return;  // banc de test uniquement
+    if (w < 32 || h < 32) return;
+    std::vector<float> A, B;
+    blur121(LR, w, h, A);
+    blur121(LF, w, h, B);
+
+    // Initialisation : translation médiane des blocs fiables ET texturés (les blocs plats donnent n'importe quoi).
+    std::vector<float> ix, iy;
+    for (int by = 0; by < gbh; ++by)
+        for (int bx = 0; bx < gbw; ++bx) {
+            const Motion& m = motion[static_cast<size_t>(by) * gbw + bx];
+            if (!m.ok) continue;
+            float g = 0.0f;
+            int cnt = 0;
+            for (int y = std::max(by * kFineBlock, 1); y < std::min((by + 1) * kFineBlock, h - 1); y += 2)
+                for (int x = std::max(bx * kFineBlock, 1); x < std::min((bx + 1) * kFineBlock, w - 1); x += 2) {
+                    const size_t i = static_cast<size_t>(y) * w + x;
+                    g += std::fabs(A[i + 1] - A[i - 1]) + std::fabs(A[i + w] - A[i - w]);
+                    ++cnt;
+                }
+            if (cnt > 0 && g / cnt > 3.0f) { ix.push_back(m.dx); iy.push_back(m.dy); }
+        }
+    double p[6] = {0, 0, 0, 0, 0, 0};
+    if (ix.size() >= 4) {
+        std::nth_element(ix.begin(), ix.begin() + ix.size() / 2, ix.end());
+        std::nth_element(iy.begin(), iy.begin() + iy.size() / 2, iy.end());
+        p[0] = ix[ix.size() / 2];
+        p[3] = iy[iy.size() / 2];
+    }
+    const double init0 = p[0], init3 = p[3];
+
+    bool good = false;
+    std::vector<float> es;
+    const int margin = 4;
+    for (int iter = 0; iter < 8; ++iter) {
+        es.clear();
+        for (int y = margin; y < h - margin; y += 2)
+            for (int x = margin; x < w - margin; x += 2) {
+                const double u = static_cast<double>(x) / w - 0.5, v = static_cast<double>(y) / h - 0.5;
+                const float sx = static_cast<float>(x + p[0] + p[1] * u + p[2] * v);
+                const float sy = static_cast<float>(y + p[3] + p[4] * u + p[5] * v);
+                if (sx < 1.0f || sy < 1.0f || sx > w - 2.0f || sy > h - 2.0f) { es.push_back(0.0f); continue; }
+                es.push_back(bilin(B.data(), w, h, sx, sy) - A[static_cast<size_t>(y) * w + x]);
+            }
+        std::vector<float> ae(es.size());
+        for (size_t i = 0; i < es.size(); ++i) ae[i] = std::fabs(es[i]);
+        std::nth_element(ae.begin(), ae.begin() + ae.size() / 2, ae.end());
+        const float cut = 4.685f * std::max(1.4826f * ae[ae.size() / 2], 1.0f);
+
+        double M[6][7] = {};
+        double wsum = 0.0;
+        size_t k = 0;
+        for (int y = margin; y < h - margin; y += 2)
+            for (int x = margin; x < w - margin; x += 2, ++k) {
+                const float e = es[k];
+                const float r = std::fabs(e) / cut;
+                if (r >= 1.0f) continue;
+                const double wt = (1.0 - r * r) * (1.0 - r * r);
+                const size_t i = static_cast<size_t>(y) * w + x;
+                const double u = static_cast<double>(x) / w - 0.5, v = static_cast<double>(y) / h - 0.5;
+                // Gradient moyen (référence + trame déplacée) : « ESM », sans biais dû à l'échantillonnage différent
+                // des deux images, ce qui compte pour les contours francs sous-échantillonnés.
+                const float sx2 = static_cast<float>(x + p[0] + p[1] * u + p[2] * v);
+                const float sy2 = static_cast<float>(y + p[3] + p[4] * u + p[5] * v);
+                const double bgx = 0.5 * (bilin(B.data(), w, h, sx2 + 1.0f, sy2) - bilin(B.data(), w, h, sx2 - 1.0f, sy2));
+                const double bgy = 0.5 * (bilin(B.data(), w, h, sx2, sy2 + 1.0f) - bilin(B.data(), w, h, sx2, sy2 - 1.0f));
+                const double gx = 0.5 * (0.5 * (A[i + 1] - A[i - 1]) + bgx), gy = 0.5 * (0.5 * (A[i + w] - A[i - w]) + bgy);
+                if (gx == 0.0 && gy == 0.0) continue;
+                const double J[6] = {gx, gx * u, gx * v, gy, gy * u, gy * v};
+                for (int a = 0; a < 6; ++a) {
+                    for (int b = 0; b < 6; ++b) M[a][b] += wt * J[a] * J[b];
+                    M[a][6] -= wt * J[a] * e;
+                }
+                wsum += wt;
+            }
+        for (int a = 0; a < 6; ++a) M[a][a] += 1e-3 * (1.0 + M[a][a] * 1e-3);  // régularisation légère
+        if (wsum < 200.0 || !solveSmall(M, 6)) break;
+        double step = 0.0;
+        for (int a = 0; a < 6; ++a) {
+            p[a] += M[a][6];
+            step = std::max(step, std::fabs(M[a][6]));
+        }
+        if (std::fabs(p[0] - init0) > 4.0 || std::fabs(p[3] - init3) > 4.0) break;   // a divergé
+        good = true;
+        if (step < 2e-3) break;
+    }
+    if (!good) {
+        // Rien d'exploitable (scène plate ou recalage impossible) : on garde l'estimation par blocs, en excluant
+        // seulement les blocs plats dont la valeur est arbitraire.
+        return;
+    }
+    if (benchEnv("PIXR_DEBUG")) std::fprintf(stderr, "LK: tx=%.3f ty=%.3f (luma px) init=(%.2f,%.2f)\n", p[0], p[3], init0, init3);
+
+    // Bloc par bloc : modèle global si le contenu colle, sinon mouvement propre s'il est meilleur, sinon rejet.
+    std::vector<float> sadG(motion.size());
+    std::vector<float> dxG(motion.size()), dyG(motion.size());
+    for (int by = 0; by < gbh; ++by)
+        for (int bx = 0; bx < gbw; ++bx) {
+            const size_t i = static_cast<size_t>(by) * gbw + bx;
+            const double u = (bx * kFineBlock + kFineBlock * 0.5) / w - 0.5, v = (by * kFineBlock + kFineBlock * 0.5) / h - 0.5;
+            dxG[i] = static_cast<float>(p[0] + p[1] * u + p[2] * v);
+            dyG[i] = static_cast<float>(p[3] + p[4] * u + p[5] * v);
+            sadG[i] = blockSadFrac(A.data(), B.data(), w, h, bx * kFineBlock, by * kFineBlock, kFineBlock, dxG[i], dyG[i]);
+        }
+    std::vector<float> sorted(sadG);
+    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+    const float thr = std::max(4.0f, 2.2f * sorted[sorted.size() / 2] + 2.0f);
+    for (int by = 0; by < gbh; ++by)
+        for (int bx = 0; bx < gbw; ++bx) {
+            const size_t i = static_cast<size_t>(by) * gbw + bx;
+            Motion& m = motion[i];
+            if (sadG[i] < thr) {
+                // Raffinement local (Lucas-Kanade par bloc) ancré sur le modèle global : une direction bien contrainte
+                // par le contenu (contour franc) est affinée, une direction ambiguë (zone plate, contour droit
+                // dans l'autre sens) reste sur le modèle global.
+                float dx = dxG[i], dy = dyG[i];
+                const int x0 = bx * kFineBlock, y0 = by * kFineBlock;
+                const int x1 = std::min(x0 + kFineBlock, w - 1), y1 = std::min(y0 + kFineBlock, h - 1);
+                constexpr double kPrior = 1500.0;
+                for (int it = 0; it < 3; ++it) {
+                    double hxx = 0, hxy = 0, hyy = 0, gx_ = 0, gy_ = 0;
+                    for (int y = std::max(y0, 1); y < y1; ++y)
+                        for (int x = std::max(x0, 1); x < x1; ++x) {
+                            const size_t j = static_cast<size_t>(y) * w + x;
+                            const double ix_ = 0.5 * (A[j + 1] - A[j - 1]), iy_ = 0.5 * (A[j + w] - A[j - w]);
+                            const double e = bilin(B.data(), w, h, x + dx, y + dy) - A[j];
+                            hxx += ix_ * ix_; hxy += ix_ * iy_; hyy += iy_ * iy_;
+                            gx_ += ix_ * e; gy_ += iy_ * e;
+                        }
+                    const double rx = -gx_ - kPrior * (dx - dxG[i]), ry = -gy_ - kPrior * (dy - dyG[i]);
+                    const double a = hxx + kPrior, b2 = hxy, c = hyy + kPrior;
+                    const double det = a * c - b2 * b2;
+                    if (det < 1e-9) break;
+                    dx += static_cast<float>((c * rx - b2 * ry) / det);
+                    dy += static_cast<float>((a * ry - b2 * rx) / det);
+                    dx = clampf(dx, dxG[i] - 1.0f, dxG[i] + 1.0f);
+                    dy = clampf(dy, dyG[i] - 1.0f, dyG[i] + 1.0f);
+                }
+                const float sref = blockSadFrac(A.data(), B.data(), w, h, x0, y0, kFineBlock, dx, dy);
+                float used = sadG[i];
+                if (sref <= sadG[i]) { m.dx = dx; m.dy = dy; used = sref; }
+                else { m.dx = dxG[i]; m.dy = dyG[i]; }
+                m.ok = true;
+                m.q = clampf(1.15f - 0.75f * used / thr, 0.25f, 1.0f);
+                continue;
+            }
+            // Contenu qui ne colle pas au mouvement global : objet en mouvement ou bloc trompeur.
+            bool own = false;
+            if (m.ok) {
+                const float s2 = blockSadFrac(A.data(), B.data(), w, h, bx * kFineBlock, by * kFineBlock, kFineBlock, m.dx, m.dy);
+                own = s2 < 0.7f * sadG[i] && s2 < thr;
+            }
+            m.ok = own;
         }
 }
 
@@ -611,6 +876,7 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
         ctx.lumaW[i] = lumaByColor[kCfaColor[cfa][i]];
     }
 
+    const auto T0 = std::chrono::steady_clock::now();
     // Alignement : luminance 2x2 (demi-résolution) ; le déplacement est exprimé en pixels de luminance.
     const int w2 = w / 2, h2 = h / 2;
     std::vector<float> LR, LF;
@@ -622,11 +888,17 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
     const float evGain = std::min(std::max(tone[0], 0.25f), 4.0f);
     const float contrast = std::min(std::max(tone[1], 0.0f), 1.0f);
     const float saturation = std::min(std::max(tone[2], 0.0f), 2.0f);
-    float denoise = 0.0f;
+    float denoise = 0.0f, autoLevels = 1.0f;
     if (env->GetArrayLength(toneArr) >= 4) {
         jfloat d = 0.0f;
         env->GetFloatArrayRegion(toneArr, 3, 1, &d);
         denoise = std::min(std::max(d, 0.0f), 1.0f);
+    }
+    if (env->GetArrayLength(toneArr) >= 5) env->GetFloatArrayRegion(toneArr, 4, 1, &autoLevels);  // 0 : désactive l'exposition auto (tests)
+    float shadowLift = 0.0f;
+    if (env->GetArrayLength(toneArr) >= 6) {
+        env->GetFloatArrayRegion(toneArr, 5, 1, &shadowLift);
+        shadowLift = std::min(std::max(shadowLift, 0.0f), 1.0f);
     }
     float blackPt = 0.0f, autoGain = 1.0f;
     {
@@ -641,7 +913,7 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                 ++hist[std::min(static_cast<int>(l * (kBins - 1) + 0.5f), kBins - 1)];
                 ++total;
             }
-        if (total > 0) {
+        if (total > 0 && autoLevels > 0.5f) {
             auto pct = [&](double q) {
                 const int64_t target = static_cast<int64_t>(q * static_cast<double>(total));
                 int64_t acc = 0;
@@ -656,21 +928,120 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
     const float toneGain = autoGain * evGain;
     std::vector<std::vector<Motion>> motions(n);
     int gbw = 0, gbh = 0;
-    for (int k = 1; k < n; ++k) {
-        rawLumaPlane(ctx, px[k], LF);
-        computeMotion(LR, LF, w2, h2, motions[k], gbw, gbh);
+    // Plans de luminance des trames, conservés en 16 bits (x128) : le rejet de mouvement par pixel s'y réfère
+    // au lieu de recalculer la luminance depuis le RAW à chaque échantillon.
+    std::vector<std::vector<uint16_t>> lumaQ(n);
+    {
+        // Chaque trame s'aligne indépendamment sur la référence : on les traite en parallèle.
+        std::vector<int> gbws(n, 0), gbhs(n, 0);
+        std::atomic<int> nextFrame{1};
+        auto alignWorker = [&]() {
+            std::vector<float> lf;
+            for (;;) {
+                const int k = nextFrame.fetch_add(1);
+                if (k >= n) break;
+                rawLumaPlane(ctx, px[k], lf);
+                lumaQ[k].resize(lf.size());
+                for (size_t i = 0; i < lf.size(); ++i)
+                    lumaQ[k][i] = static_cast<uint16_t>(std::min(std::max(lf[i], 0.0f) * 128.0f + 0.5f, 65535.0f));
+                computeMotion(LR, lf, w2, h2, motions[k], gbws[k], gbhs[k]);
+            }
+        };
+        unsigned na = std::thread::hardware_concurrency();
+        if (const char* es = benchEnv("PIXR_THREADS")) na = static_cast<unsigned>(std::atoi(es));  // banc de test uniquement
+        na = std::min(std::max(na, 1u), 4u);
+        na = std::min<unsigned>(na, static_cast<unsigned>(n - 1));
+        if (na <= 1) {
+            alignWorker();
+        } else {
+            std::vector<std::thread> pool;
+            for (unsigned t = 1; t < na; ++t) pool.emplace_back(alignWorker);
+            alignWorker();
+            for (auto& th : pool) th.join();
+        }
+        gbw = gbws[1];
+        gbh = gbhs[1];
     }
-
+    if (benchEnv("PIXR_DEBUG")) std::fprintf(stderr, "temps alignement: %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
     jintArray outArr = env->NewIntArray(static_cast<jsize>(ow * oh));
     if (!outArr) { releaseAll(); return nullptr; }
     jint* out = env->GetIntArrayElements(outArr, nullptr);
     if (!out) { releaseAll(); return nullptr; }
 
-    // Noyau gaussien tabulé sur d² ∈ [0, 4).
-    const float sigma = factor == 2 ? 0.55f : 0.65f;
+    // Noyau gaussien ADAPTATIF, tabulé sur d² ∈ [0, 4) : étroit là où l'image a du détail (on garde la finesse
+    // que la rafale permet de retrouver), large dans les zones plates (on moyenne davantage : plus de bruit retiré
+    // là où il n'y a rien à perdre). Le niveau vient du gradient de la trame de référence légèrement lissée.
+    constexpr int kLevels = 6;
+    float sigmaFlat = factor == 2 ? 0.70f : 0.80f;
+    float sigmaDetail = factor == 2 ? 0.38f : 0.38f;
+    if (const char* es = benchEnv("PIXR_SIGMA_FLAT")) sigmaFlat = static_cast<float>(std::atoi(es)) / 100.0f;      // banc de test
+    if (const char* es = benchEnv("PIXR_SIGMA_DETAIL")) sigmaDetail = static_cast<float>(std::atoi(es)) / 100.0f;  // banc de test
     constexpr int kLutN = 512;
-    std::vector<float> wl(kLutN);
-    for (int i = 0; i < kLutN; ++i) wl[i] = std::exp(-(static_cast<float>(i) / 128.0f) / (2.0f * sigma * sigma));
+    std::vector<float> wlk(static_cast<size_t>(kLevels) * kLutN);
+    for (int l = 0; l < kLevels; ++l) {
+        const float sg = sigmaFlat + (sigmaDetail - sigmaFlat) * static_cast<float>(l) / (kLevels - 1);
+        for (int i = 0; i < kLutN; ++i)
+            wlk[static_cast<size_t>(l) * kLutN + i] = std::exp(-(static_cast<float>(i) / 128.0f) / (2.0f * sg * sg));
+    }
+    std::vector<uint8_t> levelMap(static_cast<size_t>(w2) * h2, 0);
+    {
+        // Mesure du détail sur les pixels BRUTS de même couleur (distance 2) : la réduction en luminance 2x2 efface
+        // justement les détails les plus fins (période ~5 px), ceux qu'on veut garder nets.
+        std::vector<float> gmap(static_cast<size_t>(w2) * h2, 0.0f);
+        const jshort* ref = px[0];
+        for (int by = 0; by < h2; ++by)
+            for (int bx = 0; bx < w2; ++bx) {
+                float acc = 0.0f;
+                for (int j = 0; j < 2; ++j)
+                    for (int i = 0; i < 2; ++i) {
+                        const int x = bx * 2 + i, y = by * 2 + j;
+                        const float v0 = rawVal(ctx, ref, x, y);
+                        const float vx = (x + 2 < w) ? rawVal(ctx, ref, x + 2, y) : v0;
+                        const float vy = (y + 2 < h) ? rawVal(ctx, ref, x, y + 2) : v0;
+                        acc += std::fabs(vx - v0) + std::fabs(vy - v0);
+                    }
+                gmap[static_cast<size_t>(by) * w2 + bx] = acc * 255.0f * 0.125f;
+            }
+        {
+            std::vector<float> sm;
+            blur121(gmap, w2, h2, sm);
+            gmap.swap(sm);
+        }
+        std::vector<float> samp;
+        for (size_t i = 0; i < gmap.size(); i += 7) samp.push_back(gmap[i]);
+        std::nth_element(samp.begin(), samp.begin() + samp.size() / 6, samp.end());
+        const float gLo = std::max(1.5f, 1.5f * samp[samp.size() / 6]);
+        const float gHi = gLo + 7.0f;
+        for (size_t i = 0; i < gmap.size(); ++i) {
+            const float t = clampf((gmap[i] - gLo) / (gHi - gLo), 0.0f, 1.0f);
+            levelMap[i] = static_cast<uint8_t>(t * (kLevels - 1) + 0.5f);
+        }
+        if (benchEnv("PIXR_DEBUG")) {
+            int hist[kLevels] = {0};
+            for (uint8_t v : levelMap) ++hist[v];
+            std::fprintf(stderr, "niveaux de noyau (0=large..5=fin): gLo=%.2f gHi=%.2f", gLo, gHi);
+            for (int l = 0; l < kLevels; ++l) std::fprintf(stderr, " [%d]=%d", l, hist[l]);
+            // zone du réseau fin (luma 20..95 x 20..75)
+            int roi[kLevels] = {0};
+            for (int y = 20; y < 75 && y < h2; ++y) for (int x = 20; x < 95 && x < w2; ++x) ++roi[levelMap[static_cast<size_t>(y) * w2 + x]];
+            std::fprintf(stderr, " | zone fine:");
+            for (int l = 0; l < kLevels; ++l) std::fprintf(stderr, " [%d]=%d", l, roi[l]);
+            std::fprintf(stderr, "\n");
+        }
+    }
+    // Tonalité locale : remonte les ombres d'après la luminosité locale (carte très lissée de la référence).
+    // gain = (cible / luminosité locale)^force, borné, appliqué en lumière linéaire ; 1 dans les zones claires.
+    std::vector<float> gainMap;
+    if (shadowLift > 0.001f) {
+        std::vector<float> loc(LR);
+        boxBlurPlane(loc, w2, h2, std::max(8, std::min(w2, h2) / 24));
+        gainMap.resize(loc.size());
+        const float target = 0.22f * 255.0f * 0.5f;   // luminosité linéaire visée pour les ombres (dans l'échelle de LR)
+        for (size_t i = 0; i < loc.size(); ++i) {
+            const float l = std::max(loc[i] * toneGain, 1.0f);
+            gainMap[i] = std::min(std::max(std::pow(target / l, shadowLift), 1.0f), 2.2f);
+        }
+    }
     // Gamma sRGB tabulé (valeur linéaire 0..1 -> 0..255).
     constexpr int kGammaN = 4096;
     std::vector<float> gammaLut(kGammaN + 1);
@@ -683,9 +1054,17 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
     const float invF = 1.0f / static_cast<float>(factor);
     const float sharpen = textMode ? 0.6f : 0.0f;
     constexpr int tileSize = 128;
-    std::vector<float> buf, lp, dnTmp;
-    for (int64_t ty = 0; ty < oh; ty += tileSize) {
-        for (int64_t tx = 0; tx < ow; tx += tileSize) {
+    const auto T1 = std::chrono::steady_clock::now();
+    // Rayon au-delà duquel le poids du noyau est négligeable (< 0,4 %) : on saute ces échantillons.
+    float cut2[kLevels];
+    for (int l = 0; l < kLevels; ++l) {
+        const float sg = sigmaFlat + (sigmaDetail - sigmaFlat) * static_cast<float>(l) / (kLevels - 1);
+        cut2[l] = std::min(4.0f, 11.0f * sg * sg);
+    }
+    float scaleP[4];
+    int colP[4];
+    for (int i = 0; i < 4; ++i) { scaleP[i] = ctx.invRange * ctx.gainIdx[i]; colP[i] = kCfaColor[cfa][i]; }
+    auto doTile = [&](int64_t tx, int64_t ty, std::vector<float>& buf, std::vector<float>& lp, std::vector<float>& dnTmp) {
             const int tw = static_cast<int>(std::min<int64_t>(tileSize, ow - tx));
             const int th = static_cast<int>(std::min<int64_t>(tileSize, oh - ty));
             constexpr int kHalo = 3;
@@ -704,7 +1083,10 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                     const int lbx = std::min(std::max(static_cast<int>(std::max(pxf, 0.0f)) >> 1, 0), w2 - 1);
                     const int bgx = std::min(std::max(static_cast<int>(std::max(pxf, 0.0f)) >> 5, 0), gbw - 1);
                     const float refL = LR[static_cast<size_t>(lby) * w2 + lbx];
-                    float acc[3] = {0, 0, 0}, ws[3] = {0, 0, 0};
+                    const int lvl = levelMap[static_cast<size_t>(lby) * w2 + lbx];
+                    float acc[3], ws[3];
+                    auto gather = [&](const float* lutRow, float cutL) {
+                    acc[0] = acc[1] = acc[2] = 0.0f; ws[0] = ws[1] = ws[2] = 0.0f;
                     for (int k = 0; k < n; ++k) {
                         float qx = pxf, qy = py, wk = 1.0f;
                         if (k > 0) {
@@ -716,35 +1098,49 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                                 continue;
                             const int kbx = std::min(static_cast<int>(qx) >> 1, w2 - 1);
                             const int kby = std::min(static_cast<int>(qy) >> 1, h2 - 1);
-                            const float d = std::fabs(rawLuma(ctx, px[k], kbx, kby) - refL);
+                            const float d = std::fabs(static_cast<float>(lumaQ[k][static_cast<size_t>(kby) * w2 + kbx]) * (1.0f / 128.0f) - refL);
                             if (d >= kRawReject) continue;  // mouvement local : pas de fantôme
                             const float q = d / kRawReject;
-                            wk = 1.0f - q * q;
+                            wk = (1.0f - q * q) * m.q;
                         }
-                        const int ix = static_cast<int>(std::floor(qx));
-                        const int iy = static_cast<int>(std::floor(qy));
-                        for (int yy = iy - 1; yy <= iy + 2; ++yy) {
-                            if (yy < 0 || yy >= h) continue;
+                        // Fenêtre 4x4 autour de la position : constantes par parité (couleur, noir, échelle) hors boucle.
+                        const int ix = static_cast<int>(qx);   // qx, qy >= 0 ici
+                        const int iy = static_cast<int>(qy);
+                        const int xa = std::max(ix - 1, 0), xb = std::min(ix + 2, w - 1);
+                        const int ya = std::max(iy - 1, 0), yb = std::min(iy + 2, h - 1);
+                        const jshort* data = px[k];
+                        for (int yy = ya; yy <= yb; ++yy) {
                             const float dy = static_cast<float>(yy) - qy;
-                            for (int xx = ix - 1; xx <= ix + 2; ++xx) {
-                                if (xx < 0 || xx >= w) continue;
+                            const float dy2 = dy * dy;
+                            if (dy2 >= cutL) continue;
+                            const jshort* rp = data + static_cast<size_t>(yy) * w;
+                            const int yp = (yy & 1) << 1;
+                            for (int xx = xa; xx <= xb; ++xx) {
                                 const float dx = static_cast<float>(xx) - qx;
-                                const float d2 = dx * dx + dy * dy;
-                                if (d2 >= 4.0f) continue;
-                                const float wgt = wk * wl[static_cast<int>(d2 * 128.0f)];
-                                const int col = kCfaColor[cfa][((yy & 1) << 1) | (xx & 1)];
-                                acc[col] += wgt * rawVal(ctx, px[k], xx, yy);
+                                const float d2 = dx * dx + dy2;
+                                if (d2 >= cutL) continue;
+                                const int pi = yp | (xx & 1);
+                                const float val = (static_cast<float>(static_cast<uint16_t>(rp[xx])) - ctx.black[pi]) * scaleP[pi];
+                                const float wgt = wk * lutRow[static_cast<int>(d2 * 128.0f)];
+                                const int col = colP[pi];
+                                acc[col] += wgt * val;
                                 ws[col] += wgt;
                             }
                         }
                     }
+                    };
+                    gather(&wlk[static_cast<size_t>(lvl) * kLutN], cut2[lvl]);
+                    // Trame(s) trop peu nombreuses ou occultées : une couleur peut manquer dans le petit rayon du noyau fin.
+                    // On reprend alors avec le noyau large complet plutôt que de laisser un pixel sans mesure.
+                    if (lvl > 0 && (ws[0] < 0.05f || ws[1] < 0.05f || ws[2] < 0.05f)) gather(&wlk[0], cut2[0]);
                     float v[3];
                     for (int c = 0; c < 3; ++c) v[c] = ws[c] > 1e-6f ? std::min(acc[c] / ws[c], 1.0f) : 0.0f;
                     float* o = &buf[(static_cast<size_t>(y) * rw + x) * 3];
+                    const float localGain = gainMap.empty() ? 1.0f : gainMap[static_cast<size_t>(lby) * w2 + lbx];
                     float g[3];
                     for (int r = 0; r < 3; ++r) {
                         float lin = ccm[r * 3] * v[0] + ccm[r * 3 + 1] * v[1] + ccm[r * 3 + 2] * v[2];
-                        lin = clampf((lin - blackPt) * toneGain, 0.0f, 1.0f);
+                        lin = clampf((lin - blackPt) * toneGain * localGain, 0.0f, 1.0f);
                         g[r] = gammaLut[static_cast<int>(lin * kGammaN + 0.5f)] * (1.0f / 255.0f);
                     }
                     // Contraste : S-curve douce (smoothstep) mélangée à l'identité, sur chaque canal.
@@ -776,8 +1172,33 @@ Java_com_pixr_app_NativeEngine_fuseRawBurst(JNIEnv* env, jobject /*thiz*/, jobje
                     out[(ty + y) * ow + (tx + x)] = static_cast<jint>(0xFF000000u | (c[0] << 16) | (c[1] << 8) | c[2]);
                 }
             }
+    };
+    // Les tuiles sont indépendantes : on les répartit sur les cœurs disponibles.
+    std::vector<std::pair<int64_t, int64_t>> tiles;
+    for (int64_t ty = 0; ty < oh; ty += tileSize)
+        for (int64_t tx = 0; tx < ow; tx += tileSize) tiles.emplace_back(tx, ty);
+    unsigned nthreads = std::thread::hardware_concurrency();
+    if (const char* es = benchEnv("PIXR_THREADS")) nthreads = static_cast<unsigned>(std::atoi(es));  // banc de test uniquement
+    nthreads = std::min(std::max(nthreads, 1u), 6u);
+    nthreads = std::min<unsigned>(nthreads, static_cast<unsigned>(tiles.size()));
+    std::atomic<size_t> nextTile{0};
+    auto worker = [&]() {
+        std::vector<float> buf, lp, dnTmp;
+        for (;;) {
+            const size_t i = nextTile.fetch_add(1);
+            if (i >= tiles.size()) break;
+            doTile(tiles[i].first, tiles[i].second, buf, lp, dnTmp);
         }
+    };
+    if (nthreads <= 1) {
+        worker();
+    } else {
+        std::vector<std::thread> pool;
+        for (unsigned t = 1; t < nthreads; ++t) pool.emplace_back(worker);
+        worker();
+        for (auto& th : pool) th.join();
     }
+    if (benchEnv("PIXR_DEBUG")) std::fprintf(stderr, "temps fusion (tuiles, %u fils): %.2f s ; total %.2f s\n", nthreads, std::chrono::duration<double>(std::chrono::steady_clock::now() - T1).count(), std::chrono::duration<double>(std::chrono::steady_clock::now() - T0).count());
     env->ReleaseIntArrayElements(outArr, out, 0);
     releaseAll();
     return outArr;
